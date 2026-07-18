@@ -76,3 +76,6 @@ build/
 # Scratch org metadata and tools
 .sf/orgs/
 .sfdx/
+server-keys/
+.env.prod
+.env.dev
