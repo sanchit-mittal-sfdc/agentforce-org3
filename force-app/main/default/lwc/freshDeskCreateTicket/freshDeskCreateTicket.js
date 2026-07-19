@@ -1,6 +1,10 @@
 import { api, track, LightningElement } from 'lwc';
 import createTicketInFreshdesk from '@salesforce/apex/FreshdeskIntegrationBackend.createTicket';
+import getAllTickets from '@salesforce/apex/FreshdeskIntegrationBackend.getAllTickets';
 import { ShowToastEvent } from 'lightning/platformShowToastEvent';
+import { loadScript, loadStyle } from 'lightning/platformResourceLoader';
+import TAILWIND_CSS from '@salesforce/resourceUrl/Tailwind2';
+import CHART_JS from '@salesforce/resourceUrl/ChartJS';
 
 const STATUS_OPTIONS = [
     {
@@ -34,16 +38,41 @@ const PRIORITY_OPTIONS = [
 ];
 
 export default class FreshDeskCreateTicket extends LightningElement {
+    isRendered = false;
     isLoading = false;
+    @track allTickets = [];
     @api pageTitle = 'Create Freshdesk Ticket';
     statusOptions = STATUS_OPTIONS;
     priorityOptions = PRIORITY_OPTIONS;
+    pieChart = null;
+    barChart = null;
+    transcript = '';
+    recognition;
+    isListening = false;
     @track ticketData = {
         email: null,
         subject: null,
         description: null,
         status: null,
         priority: null
+    }
+
+    get allTicketsTabLabel()
+    {
+        return `All Tickets (${this.allTickets.length})`;
+    }
+
+    
+    connectedCallback() {
+        
+        Promise.all([loadScript(this, CHART_JS), loadStyle(this, TAILWIND_CSS)])
+        .then(() => {
+            console.log('Tailwind CSS and Chart.js loaded successfully');
+        })
+        .catch(error => {
+            console.error('Error loading Tailwind CSS or Chart.js : ', error);
+        });
+        this.fetchTickets();
     }
 
 
@@ -134,7 +163,8 @@ export default class FreshDeskCreateTicket extends LightningElement {
 
             // show toast message on success
             this.fireToastEvent({title: 'Success', message: `Ticket created successfully in Freshdesk with ID: ${id}`, variant: 'success'});
-        
+            this.fetchTickets(); // Refresh the tickets list after successful creation
+            
         }
         catch(e)
         {
@@ -157,5 +187,243 @@ export default class FreshDeskCreateTicket extends LightningElement {
             variant
         });
         this.dispatchEvent(evt);
+    }
+
+
+    handleAllTicketsTabActive()
+    {
+        setTimeout(() => {
+            this.renderChart();
+        }, 0)
+    }
+
+    async fetchTickets()
+    {
+        try
+        {debugger;
+            this.isLoading = true;
+            const result = await getAllTickets();
+            this.allTickets = result.tickets.map(eachTicket => {
+                return({...eachTicket, 
+                    priorityClass: this.getPriorityClass(eachTicket.priority), 
+                    statusClass: this.getStatusClass(eachTicket.status),
+                    created_at: new Intl.DateTimeFormat('en-IN', {
+                        day: '2-digit',
+                        month: 'short',
+                        year: 'numeric',
+                        hour: '2-digit',
+                        minute: '2-digit',
+                        hour12: true
+                    }).format(new Date(eachTicket.created_at))
+                });
+            });
+            this.renderChart(); // Refresh the chart after successful creation
+            console.table(this.allTickets);
+        }
+        catch(e)
+        {
+            console.error(`Error occurred while fetching tickets: ${e?.body?.message}`);
+        }
+        finally
+        {
+            this.isLoading = false;
+        }
+    }
+
+
+    getPriorityClass(priority)
+    {
+        switch (priority.toLowerCase()) {
+        case "urgent":
+            return 'bg-red-100 text-red-700 text-xs font-semibold px-3 py-1 rounded-full';
+            break;
+        case "high":
+            return 'bg-red-100 text-red-700 text-xs font-semibold px-3 py-1 rounded-full';
+            break;
+        case "medium":
+            return 'bg-yellow-100 text-yellow-700 text-xs font-semibold px-3 py-1 rounded-full';
+            break;    
+        default:
+            return 'bg-green-100 text-green-700 text-xs font-semibold px-3 py-1 rounded-full';
+        }
+        
+    }
+
+
+    getStatusClass(status)
+    {
+        switch (status.toLowerCase()) {
+        case "open":
+            return 'bg-red-100 text-red-700 text-xs font-semibold px-3 py-1 rounded-full';
+            break;
+        case "pending":
+            return 'bg-orange-100 text-orange-700 text-xs font-semibold px-3 py-1 rounded-full';
+            break;
+        case "resolved":
+            return 'bg-green-100 text-green-700 text-xs font-semibold px-3 py-1 rounded-full';
+            break; 
+        case "closed":
+            return 'bg-green-100 text-green-700 text-xs font-semibold px-3 py-1 rounded-full';
+            break;        
+        default:
+            return 'bg-green-100 text-green-700 text-xs font-semibold px-3 py-1 rounded-full';
+        }
+        
+    }
+
+    renderChart()
+    {
+        if(this.pieChart)
+        {
+            this.pieChart.destroy();
+        }
+
+        if(this.barChart)
+        {
+            this.barChart.destroy();
+        }
+        
+        const ctx1 = this.template.querySelector('.myPieChart');
+        const ctx2 = this.template.querySelector('.myBarChart');
+
+        if(!ctx1)
+        {
+            console.error('ctx chart component not found with class myPieChart');
+            return;
+        }
+
+        if(!ctx2)
+        {
+            console.error('ctx chart component not found with class myBarChart');
+            return;
+        }
+
+        let chartData = this.allTickets.reduce((acc, item) => {
+            if(!acc[item.status])
+            {
+                acc[item.status] = 1;
+            }
+            else
+            {
+                acc[item.status] += 1;
+            }
+            return acc;
+        }, {});
+
+        let statusList = Object.keys(chartData);
+        let statusCounts = Object.values(chartData);
+
+        
+       this.barChart = new Chart(ctx2, {
+            type: 'bar',
+            data: {
+            labels: statusList,
+            datasets: [{
+                label: '# of Votes',
+                data: statusCounts,
+                borderWidth: 1
+            }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                scales: {
+                    y: {
+                    beginAtZero: true
+                    }
+                }
+            }
+        });
+        
+
+        const data = {
+            labels: statusList,
+            datasets: [{
+                label: 'Ticket(s)',
+                data: statusCounts,
+                backgroundColor: [
+                'rgb(255, 99, 132)',
+                'rgb(54, 162, 235)',
+                'rgb(255, 205, 86)'
+                ],
+                hoverOffset: 4
+            }]
+            };
+        this.pieChart = new Chart(ctx1, {
+            type: 'doughnut',
+            data
+        });
+    }
+
+
+
+    startListening() {
+
+        const SpeechRecognition =
+            window.SpeechRecognition ||
+            window.webkitSpeechRecognition;
+
+        if (!SpeechRecognition) {
+
+            this.fireToastEvent({
+                title: 'Error',
+                message: 'Speech Recognition is not supported in this browser.',
+                variant: 'error'
+            });
+
+            return;
+        }
+
+        this.recognition = new SpeechRecognition();
+
+        this.recognition.lang = 'en-IN';
+
+        this.recognition.continuous = true;
+
+        this.recognition.interimResults = true;
+
+        this.isListening = true;
+
+        this.recognition.onresult = (event) => {
+
+            let text = '';
+
+            for (let i = 0; i < event.results.length; i++) {
+
+                text += event.results[i][0].transcript + ' ';
+            }
+
+            this.transcript = text;
+
+        };
+
+        this.recognition.onerror = (event) => {
+
+            console.error(event);
+
+            this.isListening = false;
+
+        };
+
+        this.recognition.onend = () => {
+
+            this.isListening = false;
+
+        };
+
+        this.recognition.start();
+
+    }
+
+
+
+    stopListening() {
+
+        if (this.recognition) {
+
+            this.recognition.stop();
+
+        }
+
     }
 }
