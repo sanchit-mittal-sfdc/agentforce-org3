@@ -1,0 +1,45 @@
+<template>
+    <lightning-card title={pageTitle}>
+
+        <template if:true={isLoading}>
+            <div class="slds-align_absolute-center">
+                <lightning-spinner alternative-text="Loading" size="medium"></lightning-spinner>
+            </div>
+        </template>
+
+        
+        <lightning-layout multiple-rows>
+
+            <lightning-layout-item size="12" padding="around-small">
+                <lightning-input required type="email" label="Email" name="email" value={ticketData.email} onchange={handleInputChange} onblur={validateFields}>
+                </lightning-input>
+            </lightning-layout-item>  
+            
+            <lightning-layout-item size="12" padding="around-small">
+                <lightning-input required label="Subject" name="subject" value={ticketData.subject} onchange={handleInputChange} onblur={validateFields}>
+                </lightning-input>
+            </lightning-layout-item>  
+
+            <lightning-layout-item size="12" padding="around-small">
+                <lightning-input required label="Description" name="description" value={ticketData.description} onchange={handleInputChange} onblur={validateFields}>
+                </lightning-input>
+            </lightning-layout-item>
+
+            <lightning-layout-item size="12" padding="around-small">
+                <lightning-combobox required options={statusOptions} value= {ticketData.status} label="Status" name="status" onchange={handleInputChange}>
+                </lightning-combobox>
+            </lightning-layout-item>
+
+            <lightning-layout-item size="12" padding="around-small">
+                <lightning-combobox required options={priorityOptions} value={ticketData.priority} label="Priority" name="priority" onchange={handleInputChange}>
+                </lightning-combobox>
+            </lightning-layout-item>
+
+            <lightning-layout-item size="12" padding="around-small">
+                <lightning-button variant="brand" label="Create Ticket" onclick={createTicket}></lightning-button>
+            </lightning-layout-item>
+
+        </lightning-layout>
+
+    </lightning-card>
+</template>
