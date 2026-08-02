@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<PermissionSet xmlns="http://soap.sforce.com/2006/04/metadata">
+    <applicationVisibilities>
+        <application>Integration_Hub</application>
+        <visible>true</visible>
+    </applicationVisibilities>
+    <classAccesses>
+        <apexClass>FreshdeskIntegrationBackend</apexClass>
+        <enabled>true</enabled>
+    </classAccesses>
+    <customMetadataTypeAccesses>
+        <enabled>true</enabled>
+        <name>API_KEY_Integrations__mdt</name>
+    </customMetadataTypeAccesses>
+    <description>I am creating everything in dev and then deploying to prod via Ci CD...so making this PSET to assign all permissions.</description>
+    <hasActivationRequired>false</hasActivationRequired>
+    <label>Consolidated Permission Set</label>
+    <tabSettings>
+        <tab>FreshDesk</tab>
+        <visibility>Visible</visibility>
+    </tabSettings>
+</PermissionSet>
