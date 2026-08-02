@@ -1,6 +1,7 @@
 import { api, track, LightningElement } from 'lwc';
 import createTicketInFreshdesk from '@salesforce/apex/FreshdeskIntegrationBackend.createTicket';
 import getAllTickets from '@salesforce/apex/FreshdeskIntegrationBackend.getAllTickets';
+import generateTicketDetailsFromVoiceTranscriptUsingAi from '@salesforce/apex/FreshdeskIntegrationBackend.generateTicketDetailsFromVoiceTranscriptUsingAi';
 import { ShowToastEvent } from 'lightning/platformShowToastEvent';
 import { loadScript, loadStyle } from 'lightning/platformResourceLoader';
 import TAILWIND_CSS from '@salesforce/resourceUrl/Tailwind2';
@@ -41,7 +42,7 @@ export default class FreshDeskCreateTicket extends LightningElement {
     isRendered = false;
     isLoading = false;
     @track allTickets = [];
-    @api pageTitle = 'Create Freshdesk Ticket';
+    @api pageTitle = 'Create Case in Freshdesk/SF (Fallback If Freshdesk is down)';
     statusOptions = STATUS_OPTIONS;
     priorityOptions = PRIORITY_OPTIONS;
     pieChart = null;
@@ -78,16 +79,21 @@ export default class FreshDeskCreateTicket extends LightningElement {
 
     handleInputChange(event)
     {
-        debugger;
+        //debugger;
         const { name, value } = event.target;
         const numericFields = ['status', 'priority'];
         this.ticketData[name] = numericFields.includes(name) ? parseInt(value) : (value.trim() === '' ? null: value.trim());
     }
 
+    handleTranscriptChange(event)
+    {
+        this.transcript = event.target.value;
+    }
+
 
     validateFields(event)
     {
-        debugger;
+        //debugger;
         // If the event is passed, it means we are validating a single field on blur
         if(event)
         {
@@ -108,7 +114,7 @@ export default class FreshDeskCreateTicket extends LightningElement {
         // This part is for validating all fields when the user clicks the submit button
         let allValid = true;
 
-        this.template.querySelectorAll('lightning-input, lightning-combobox').forEach(inputField => {
+        this.template.querySelectorAll('lightning-input, lightning-combobox, lightning-textarea').forEach(inputField => {
             
             if(inputField.required && (inputField.value === null || inputField.value === undefined || (typeof inputField.value === 'string' && inputField.value.trim() === '') ))
             {
@@ -133,7 +139,7 @@ export default class FreshDeskCreateTicket extends LightningElement {
     {
         this.isLoading = true;
         let allValid = this.validateFields();
-        debugger;
+        //debugger;
         //alert('allValid: ' + allValid);
         if(!allValid)
         {
@@ -149,7 +155,7 @@ export default class FreshDeskCreateTicket extends LightningElement {
             console.log(resp);
 
             const { status, statusCode, response } = resp;
-            const {id} = response;
+            const {id, caseNumber} = response;
             // This part will execute only when successful response is received from the backend
             
             // Empty the form fields after successful ticket creation
@@ -161,14 +167,37 @@ export default class FreshDeskCreateTicket extends LightningElement {
                 priority: null
             }
 
-            // show toast message on success
-            this.fireToastEvent({title: 'Success', message: `Ticket created successfully in Freshdesk with ID: ${id}`, variant: 'success'});
+            if(caseNumber)
+            {
+                //this.fireToastEvent({title: 'Success', message: `Ticket created successfully in Salesforce with Case Number: ${caseNumber}`, variant: 'success'});
+                // show toast message with clickable case number link to case record page in salesforce
+                const caseLink = `/lightning/r/Case/${id}/view`;
+                
+                const event = new ShowToastEvent({
+                                    title: "Success!",
+                                    variant: "success",
+                                    mode: "sticky",
+                                    message: "Ticket created successfully in {0} with {1}!",
+                                    messageData: [
+                                        "Salesforce",
+                                        {
+                                            url: caseLink,
+                                            label: "Case Number: " + caseNumber,
+                                        },
+                                    ],
+                                    });
+                this.dispatchEvent(event);
+            }
+            else
+            {
+                this.fireToastEvent({title: 'Success', message: `Ticket created successfully in Freshdesk with ID: ${id}`, variant: 'success'});
+            }
             this.fetchTickets(); // Refresh the tickets list after successful creation
             
         }
         catch(e)
         {
-            debugger;
+            //debugger;
             //print the complete message
             console.error('Error creating ticket in Freshdesk: ', e);
             this.fireToastEvent({title: 'Error', message: `Error creating ticket in Freshdesk: ${e.body ? e.body.message : e.message}`, variant: 'error'});
@@ -179,13 +208,23 @@ export default class FreshDeskCreateTicket extends LightningElement {
         }
     }
 
-    fireToastEvent({ title, message, variant })
+    fireToastEvent({ title, message, variant, mode="" })
     {
         const evt = new ShowToastEvent({
             title,
             message,
-            variant
+            variant,
+            mode
         });
+        this.dispatchEvent(evt);
+    }
+
+
+    handleAllTicketsTabActive()
+    {
+        setTimeout(() => {
+            this.renderChart();
+        }, 0);
         this.dispatchEvent(evt);
     }
 
@@ -203,8 +242,10 @@ export default class FreshDeskCreateTicket extends LightningElement {
         {debugger;
             this.isLoading = true;
             const result = await getAllTickets();
+            console.log('Fetched tickets: ', result);
             this.allTickets = result.tickets.map(eachTicket => {
                 return({...eachTicket, 
+                    id: eachTicket.caseNumber ? eachTicket.caseNumber : eachTicket.id,
                     priorityClass: this.getPriorityClass(eachTicket.priority), 
                     statusClass: this.getStatusClass(eachTicket.status),
                     created_at: new Intl.DateTimeFormat('en-IN', {
@@ -378,9 +419,9 @@ export default class FreshDeskCreateTicket extends LightningElement {
 
         this.recognition.lang = 'en-IN';
 
-        this.recognition.continuous = true;
+        this.recognition.continuous = true; // Set to true if you want continuous recognition for eg. for long conversations
 
-        this.recognition.interimResults = true;
+        this.recognition.interimResults = true; // Set to true if you want to get results as the user speaks, false will give results only after the user stops speaking
 
         this.isListening = true;
 
@@ -426,4 +467,59 @@ export default class FreshDeskCreateTicket extends LightningElement {
         }
 
     }
+
+
+    async generateTicketDetailsFromTranscriptUsingAi() 
+    {
+        if(this.transcript?.trim() === '' || this.transcript === null || this.transcript === undefined)
+        {
+            return;
+        }
+            
+        this.isLoading = true;
+        
+        try
+        {
+            const aiOutput = await generateTicketDetailsFromVoiceTranscriptUsingAi({ voiceTranscript: this.transcript});
+            console.log('AIoutput: ', aiOutput);
+            const { subject, description, confidence } = aiOutput;
+            const { level, reason } = confidence;
+            
+            if(level?.toLowerCase() === 'low')
+            {
+                this.fireToastEvent({title: 'Low Confidence', message: `Ticket details could not be generated from voice transcript using AI due to LOW confidence level and reason: ${reason}`, variant: 'error', mode: 'sticky'});
+            }
+            else if(level?.toLowerCase() === 'medium')
+            {
+                this.fireToastEvent({title: 'Medium Confidence', message: `Ticket details generated from voice transcript using AI with confidence level: ${level} and reason: ${reason}`, variant: 'warning', mode: 'sticky'});
+                this.ticketData = {...this.ticketData, subject, description};
+            }
+            else if(level?.toLowerCase() === 'high')
+            {
+                this.fireToastEvent({title: 'High Confidence', message: `Ticket details generated from voice transcript using AI with confidence level: ${level} and reason: ${reason}`, variant: 'success', mode: 'sticky'});
+                this.ticketData = {...this.ticketData, subject, description};
+            }
+        }
+        catch(error)
+        {
+            console.error('Error generating ticket details from voice transcript using AI: ', error);
+            this.fireToastEvent({title: 'Error', message: `Error generating ticket details from voice transcript using AI: ${error.body ? error.body.message : error.message}`, variant: 'error'});
+        }
+        finally
+        {
+            this.isLoading = false;
+        }
+        
+        
+    }
+
+    get isAiButtonDisabled()
+    {
+        if(this.transcript?.length > 5)
+        {
+            return false;
+        }
+        return true;
+    } 
+
 }

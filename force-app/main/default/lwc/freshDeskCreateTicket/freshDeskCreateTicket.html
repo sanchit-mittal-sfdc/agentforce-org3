@@ -11,8 +11,9 @@
         <div class="slds-p-around_medium">
 
             <lightning-textarea
-                label="Describe your issue by speaking"
+                label="Describe your issue by speaking / typing"
                 value={transcript}
+                onchange={handleTranscriptChange}
                 rows="6">
             </lightning-textarea>
 
@@ -30,6 +31,14 @@
                     label="🛑 Stop Listening"
                     variant="destructive"
                     onclick={stopListening}
+                    class="slds-m-left_small">
+                </lightning-button>
+
+                <lightning-button
+                    disabled={isAiButtonDisabled}
+                    label="Generate Ticket Details Using AI 🤖"
+                    variant="success"
+                    onclick={generateTicketDetailsFromTranscriptUsingAi}
                     class="slds-m-left_small">
                 </lightning-button>
 
@@ -64,8 +73,8 @@
                     </lightning-layout-item>  
 
                     <lightning-layout-item size="12" padding="around-small">
-                        <lightning-input required label="Description" name="description" value={ticketData.description} onchange={handleInputChange} onblur={validateFields}>
-                        </lightning-input>
+                        <lightning-textarea required label="Description" name="description" value={ticketData.description} onchange={handleInputChange} onblur={validateFields}>
+                        </lightning-textarea>
                     </lightning-layout-item>
 
                     <lightning-layout-item size="12" padding="around-small">
