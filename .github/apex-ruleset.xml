@@ -1,0 +1,73 @@
+<?xml version="1.0" ?>
+<!--
+  =====================================================================
+  PMD RULESET FOR APEX
+  FILE : .github/apex-ruleset.xml
+  =====================================================================
+
+  WHAT IS PMD?
+    PMD is an open-source static code analyser. Its Apex module reads
+    .cls and .trigger files and reports rule violations (bugs waiting to
+    happen, bad practice, security holes, slow patterns).
+
+  WHAT IS A RULESET?
+    A ruleset is an XML file that says WHICH PMD rules to apply. PMD ships
+    with its rules grouped into categories; a ruleset picks categories (or
+    single rules).
+
+  WHO USES THIS FILE?
+    code-analyzer.yml  ->  engines.pmd.custom_rulesets  points here.
+    Salesforce Code Analyzer v5 hands it to its PMD engine when the
+    pipeline runs "sf code-analyzer run".
+
+  WHY IS IT UNDER .github/ ?
+    It is pipeline tooling configuration, kept next to the pipeline files.
+    If you move it, update the path in code-analyzer.yml.
+
+  HOW TO CUSTOMISE (examples):
+    * Drop a whole category: delete its <rule ref="..."/> line.
+    * Exclude ONE noisy rule but keep the rest of its category:
+        <rule ref="category/apex/codestyle.xml">
+          <exclude name="ApexDoc"/>
+        </rule>
+    * Change a rule's priority/properties: see PMD's Apex rule reference.
+  The category files below are resolved from PMD's own bundled rules, so no
+  rule definitions need to be copied into this repo.
+  =====================================================================
+-->
+<ruleset
+  name="Purina CA Apex Ruleset"
+  xmlns="http://pmd.sourceforge.net/ruleset/2.0.0"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xsi:schemaLocation="http://pmd.sourceforge.net/ruleset/2.0.0
+        https://pmd.sourceforge.io/ruleset_2_0_0.xsd"
+>
+
+    <description>Purina CA Apex Rules</description>
+
+    <!-- BEST PRACTICES: recommended habits, e.g. unit tests must contain
+         assertions, avoid hard-coded record Ids, bulkification hints. -->
+    <rule ref="category/apex/bestpractices.xml" />
+
+    <!-- CODE STYLE: naming conventions, formatting, braces, documentation.
+         Usually the noisiest category (many Low-severity findings). -->
+    <rule ref="category/apex/codestyle.xml" />
+
+    <!-- DESIGN: complexity and structure, e.g. very long methods, deeply
+         nested ifs, too many fields/methods, high cyclomatic complexity. -->
+    <rule ref="category/apex/design.xml" />
+
+    <!-- ERROR PRONE: patterns that often cause bugs, e.g. empty catch
+         blocks, DML or SOQL inside loops (governor-limit risks). -->
+    <rule ref="category/apex/errorprone.xml" />
+
+    <!-- PERFORMANCE: inefficient code, e.g. queries or DML in loops,
+         unnecessary operations that waste CPU time or heap. -->
+    <rule ref="category/apex/performance.xml" />
+
+    <!-- SECURITY: SOQL/SOSL injection, missing CRUD/FLS enforcement,
+         sharing problems, insecure endpoints, hard-coded credentials.
+         The most important category for reviews. -->
+    <rule ref="category/apex/security.xml" />
+
+</ruleset>

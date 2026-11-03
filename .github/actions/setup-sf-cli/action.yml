@@ -1,0 +1,77 @@
+# =====================================================================
+# COMPOSITE ACTION : setup-sf-cli
+# FILE             : .github/actions/setup-sf-cli/action.yml
+# =====================================================================
+#
+# PURPOSE:
+#   A GitHub-hosted runner is a brand-new, empty Ubuntu machine for every
+#   run. It has Node.js and npm, but NOT the Salesforce CLI. This action
+#   installs:
+#     1. The Salesforce CLI (command: "sf")     from npm  (@salesforce/cli)
+#     2. The sfdx-git-delta plugin ("SGD")      via "sf plugins install"
+#        which adds the command "sf sgd source delta".
+#
+# WHY INSTALL FROM NPM AND NOT USE A GITHUB ACTION?
+#   Our enterprise only allows a whitelist of third-party actions. npm is
+#   always available, so installing with plain shell commands needs no
+#   approval and gives us full control over the version.
+#
+# VERSION PINNING:
+#   Both versions default to 'latest'. That is convenient but risky: a new
+#   release can change behaviour overnight and break a working pipeline.
+#   Once stable, set SF_CLI_VERSION / SGD_VERSION in the GitHub Environment
+#   (or repo variables) to fixed values such as 2.80.8 for reproducible runs.
+#
+# USED BY: salesforce-validation.yml and salesforce-deployment.yml.
+# =====================================================================
+
+name: Setup Salesforce CLI
+description: Installs the Salesforce CLI and the sfdx-git-delta plugin on the runner.
+
+inputs:
+  cli-version:
+    description: Version of @salesforce/cli (npm tag or version)
+    required: false
+    default: latest
+  sgd-version:
+    description: Version of the sfdx-git-delta plugin
+    required: false
+    default: latest
+
+runs:
+  using: composite
+  steps:
+    - name: Install Salesforce CLI
+      shell: bash
+      # Passed through env: (not pasted into the script) to avoid injection.
+      env:
+        CLI_VERSION: ${{ inputs.cli-version }}
+      run: |
+        # npm install  = download and install a package.
+        # --global     = install system-wide so the "sf" command is on the
+        #                PATH for every following step.
+        # @salesforce/cli@<ver> = package name @ version-or-tag.
+        npm install --global "@salesforce/cli@${CLI_VERSION}"
+        # "command -v sf" prints the path of the sf executable; with
+        # -e/pipefail the step FAILS if sf is not found. It is a cheap
+        # self-test of the install.
+        command -v sf
+        # Print the installed version into the log - essential when you
+        # debug "it worked yesterday" problems.
+        sf --version
+
+    - name: Install sfdx-git-delta plugin
+      shell: bash
+      env:
+        SGD_VERSION: ${{ inputs.sgd-version }}
+      run: |
+        # SGD is a community plugin, NOT signed by Salesforce. The CLI
+        # therefore asks interactively "Do you want to continue? (y/N)".
+        # A CI runner has no keyboard, so we pipe the answer: "echo y |"
+        # sends the letter y (plus Enter) to the command's standard input.
+        # (Alternative: add the plugin to unsignedPluginAllowList.json.)
+        echo y | sf plugins install "sfdx-git-delta@${SGD_VERSION}"
+        # Verify that the plugin really appears in the plugin list.
+        # grep exits non-zero when nothing matches -> step fails.
+        # > /dev/null hides the output; we only care about the exit code.
+        sf plugins | grep "sfdx-git-delta" > /dev/null

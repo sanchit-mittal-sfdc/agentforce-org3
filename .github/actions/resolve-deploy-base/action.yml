@@ -1,0 +1,130 @@
+# =====================================================================
+# COMPOSITE ACTION : resolve-deploy-base
+# FILE             : .github/actions/resolve-deploy-base/action.yml
+# =====================================================================
+#
+# PURPOSE:
+#   Decide WHICH COMMIT the deployment delta starts from, i.e. "what is
+#   currently live in this org?". Used only by the deployment workflow.
+#   (Validation does not need it; it uses git merge-base instead.)
+#
+# THE DECISION, IN ORDER (first match wins):
+#   1. Manual override  : input use-manual-sha == 'true'
+#                         -> use input manual-sha (must be a real commit).
+#   2. Normal case      : the annotated git tag  deployed/<environment>
+#                         (moved forward by the deployment workflow after
+#                         every successful real deploy).
+#   3. Neither exists   : FAIL with an explanation. We NEVER guess a
+#                         fallback such as HEAD~1, because a wrong guess
+#                         would silently deploy too little or too much.
+#
+# SAFETY CHECK (both paths):
+#   The chosen base must be an ANCESTOR of HEAD. If it is not (force push,
+#   tag created on another branch, wrong SHA) the diff would be meaningless
+#   or reversed, so we fail instead.
+#
+# WHEN IS THE MANUAL OVERRIDE NEEDED?
+#   - The very first deploy to an environment (no tag exists yet): set it
+#     to the commit that is currently live in that org.
+#   - A tag was deleted or moved wrongly.
+#   - You deliberately want to re-deploy a specific range.
+#   AFTER USING IT set DELTA_USE_MANUAL_FROM_SHA back to false, otherwise
+#   every later deploy keeps starting from that same old SHA.
+#   (Alternative without variables: create and push the tag yourself:
+#       git tag deployed/uat <sha-live-in-uat> && git push origin deployed/uat)
+#
+# OUTPUTS (readable by the caller as steps.<id>.outputs.<name>):
+#   sha    - the resolved base commit
+#   source - human readable origin ("tag deployed/dev" or "MANUAL ...")
+# =====================================================================
+
+name: Resolve deploy delta base
+description: Decides which commit the deployment delta starts from. Uses manual SHA override if enabled, otherwise the deployed/<environment> tag.
+
+inputs:
+  environment:
+    description: GitHub Environment name
+    required: true
+  use-manual-sha:
+    description: "'true' to use manual-sha instead of the tag"
+    required: false
+    default: ""
+  manual-sha:
+    description: Commit SHA to calculate the delta from (used only when use-manual-sha is true)
+    required: false
+    default: ""
+
+# ---------------------------------------------------------------------
+# OUTPUTS of a composite action must be mapped explicitly from the output
+# of one of its inner steps (here the step with id "resolve" below).
+# Without this mapping the caller could not read steps.base.outputs.sha.
+# ---------------------------------------------------------------------
+outputs:
+  sha:
+    description: Resolved base commit SHA
+    value: ${{ steps.resolve.outputs.sha }}
+  source:
+    description: Where the base came from (tag or manual override)
+    value: ${{ steps.resolve.outputs.source }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve base commit
+      # id lets the "outputs:" block above point to this step.
+      id: resolve
+      shell: bash
+      env:
+        TARGET_ENV: ${{ inputs.environment }}
+        USE_MANUAL: ${{ inputs.use-manual-sha }}
+        MANUAL_SHA: ${{ inputs.manual-sha }}
+      run: |
+        # Small helper function: print a red error annotation and stop.
+        # $1 is the first argument given to the function.
+        fail() { echo "::error::$1"; exit 1; }
+
+        if [ "$USE_MANUAL" = "true" ]; then
+          # ---- PATH 1: manual override --------------------------------
+          # [[ string =~ regex ]] is bash regex matching.
+          # ^[0-9a-fA-F]{7,40}$ = 7 to 40 hex characters only (a short or
+          # full git SHA). Rejects empty values and junk like "main; rm -rf".
+          # "|| fail ..." runs only when the test is false. The trailing \
+          # just continues the command on the next line.
+          [[ "$MANUAL_SHA" =~ ^[0-9a-fA-F]{7,40}$ ]] \
+            || fail "DELTA_USE_MANUAL_FROM_SHA is true but DELTA_MANUAL_FROM_SHA is empty or not a valid commit SHA."
+          # git cat-file -e "<sha>^{commit}" exits 0 only if that object
+          # exists AND is a commit. ^{commit} means "peel to a commit".
+          # 2> /dev/null hides git's own error text; we print our own.
+          git cat-file -e "${MANUAL_SHA}^{commit}" 2> /dev/null \
+            || fail "Commit ${MANUAL_SHA} does not exist in this repository."
+          # Expand a possibly short SHA to the full 40 character SHA.
+          BASE_SHA=$(git rev-parse "${MANUAL_SHA}^{commit}")
+          SOURCE="MANUAL OVERRIDE via DELTA_MANUAL_FROM_SHA"
+          # Loud yellow warning so nobody forgets to switch it off again.
+          echo "::warning::Manual delta base in use (${BASE_SHA}). Set DELTA_USE_MANUAL_FROM_SHA to false once done."
+        else
+          # ---- PATH 2: the deployed/<env> tag -------------------------
+          TAG="deployed/${TARGET_ENV}"
+          # git rev-parse --verify --quiet <ref>^{commit}
+          #   --verify : succeed only if the ref resolves to exactly one object
+          #   --quiet  : print nothing on failure (we handle the failure)
+          # An ANNOTATED tag is its own object; ^{commit} peels it down to
+          # the commit it points to. > /dev/null hides the printed SHA here.
+          git rev-parse --verify --quiet "refs/tags/${TAG}^{commit}" > /dev/null \
+            || fail "Tag '${TAG}' not found. For the first deploy to this environment set DELTA_USE_MANUAL_FROM_SHA=true and DELTA_MANUAL_FROM_SHA to the commit currently live in the org."
+          # Same command again, this time keeping the output (the SHA).
+          BASE_SHA=$(git rev-parse "refs/tags/${TAG}^{commit}")
+          SOURCE="tag ${TAG}"
+        fi
+
+        # ---- SAFETY CHECK (both paths) --------------------------------
+        # git merge-base --is-ancestor A B exits 0 if A is an ancestor of B
+        # (i.e. B contains all of A's history). It prints nothing.
+        git merge-base --is-ancestor "$BASE_SHA" HEAD \
+          || fail "Delta base ${BASE_SHA} is not an ancestor of HEAD."
+
+        echo "Delta base: ${BASE_SHA} (${SOURCE})"
+        # Return values to the caller through the special $GITHUB_OUTPUT file
+        # (format: name=value, one per line).
+        echo "sha=${BASE_SHA}" >> "$GITHUB_OUTPUT"
+        echo "source=${SOURCE}" >> "$GITHUB_OUTPUT"

@@ -1,0 +1,196 @@
+# =====================================================================
+# COMPOSITE ACTION : sf-deploy
+# FILE             : .github/actions/sf-deploy/action.yml
+# =====================================================================
+#
+# PURPOSE:
+#   Send the delta folder to the (already logged-in) Salesforce org.
+#   ONE action serves BOTH pipelines, switched by the input "dry-run":
+#
+#     dry-run = "true"  -> Validation. Salesforce compiles, checks
+#                          dependencies and runs tests, then DISCARDS the
+#                          result. Nothing changes in the org.
+#                          (used by the PR validation, or deployment
+#                           workflow with mode = dry-run)
+#     dry-run = "false" -> Real deployment. Changes are committed to the org.
+#
+# PREREQUISITES (done by earlier steps of the calling workflow):
+#   - Salesforce CLI installed             (setup-sf-cli)
+#   - delta/ folder exists                 (calculate-delta)
+#   - org logged in and set as default     (sf-login)
+#
+# WHAT IT DEPLOYS, IN TWO SEPARATE DEPLOYMENTS:
+#   1. delta/package/package.xml
+#        The components that were ADDED or MODIFIED.
+#   2. delta/destructiveChanges/destructiveChanges.xml
+#        The components that were DELETED in git. Deleting metadata from an
+#        org is dangerous and irreversible, so this part is OFF by default and
+#        runs only if allow-destructive is exactly "true" (environment
+#        variable ALLOW_DESTRUCTIVE_CHANGES). When off, the action prints a
+#        loud warning and adds a note to the run summary instead.
+#        It uses --post-destructive-changes: the deletions are executed AFTER
+#        the normal deployment, so a component can be replaced and the old one
+#        removed in the same release without dependency errors.
+#
+# "EMPTY" DELTA HANDLING:
+#   sfdx-git-delta always writes the XML files, but when nothing changed they
+#   contain only <version> and no <types> block. Deploying an empty manifest
+#   would error, so the helper has_types() below checks for "<types>" first
+#   and skips that part with a friendly message.
+#
+# APEX TESTS (input test-level):
+#   NoTestRun         no tests (allowed in sandboxes; NOT allowed in
+#                     production when Apex is part of the deployment)
+#   RunLocalTests     all tests in the org except managed-package tests.
+#                     Org-wide >=75% coverage is required, and ANY failing
+#                     test fails the deployment (even unrelated ones)
+#   RunSpecifiedTests only the classes in test-classes (one --tests flag
+#                     per class). Each deployed class needs >=75% coverage
+#                     from those tests
+#   RunAllTestsInOrg  everything, including managed packages (slow)
+# =====================================================================
+
+name: Salesforce deploy or validate delta
+description: Deploys the delta folder to the default org. With dry-run=true nothing is saved.
+
+inputs:
+  username:
+    description: Salesforce username of the target org
+    required: true
+  dry-run:
+    description: "'true' to validate only (--dry-run), 'false' to really deploy"
+    required: true
+  test-level:
+    description: NoTestRun, RunLocalTests, RunSpecifiedTests or RunAllTestsInOrg
+    required: true
+  test-classes:
+    description: Comma or space separated test classes (used only for RunSpecifiedTests)
+    required: false
+    default: ""
+  allow-destructive:
+    description: "'true' to execute destructive changes, 'false' to skip and warn"
+    required: false
+    default: "false"
+  delta-dir:
+    description: Folder produced by the calculate-delta action
+    required: false
+    default: delta
+  wait-minutes:
+    description: Minutes to wait for the deployment
+    required: false
+    default: "60"
+
+runs:
+  using: composite
+  steps:
+    # The step NAME is itself an expression, so the log shows a different
+    # title depending on the mode. Useful: at a glance you can tell whether
+    # a run only validated or really changed the org.
+    - name: ${{ inputs.dry-run == 'true' && 'Validate delta (dry-run, nothing is saved)' || 'Deploy delta (changes are saved to org)' }}
+      shell: bash
+      env:
+        SF_USERNAME: ${{ inputs.username }}
+        DRY_RUN: ${{ inputs.dry-run }}
+        TEST_LEVEL: ${{ inputs.test-level }}
+        TEST_CLASSES: ${{ inputs.test-classes }}
+        ALLOW_DESTRUCTIVE: ${{ inputs.allow-destructive }}
+        DELTA: ${{ inputs.delta-dir }}
+        WAIT: ${{ inputs.wait-minutes }}
+      run: |
+        # has_types FILE : succeeds only if FILE exists (-f) AND contains a
+        # <types> tag. grep flags: -q = quiet (no output, only exit code),
+        # -i = ignore case. "&&" means the grep runs only if the file exists.
+        has_types() { [ -f "$1" ] && grep -qi "<types>" "$1"; }
+
+        # Build the optional "--dry-run" flag as a bash ARRAY. An array keeps
+        # each argument separate and correctly quoted; an empty array expands
+        # to nothing, so a real deploy passes no extra flag at all.
+        MODE_ARGS=()
+        ACTION="Deploying"      # word used in log messages
+        if [ "$DRY_RUN" = "true" ]; then
+          MODE_ARGS=(--dry-run)
+          ACTION="Validating"
+        fi
+
+        # Test flags, also as an array. --test-level is always passed.
+        TEST_ARGS=(--test-level "$TEST_LEVEL")
+        if [ "$TEST_LEVEL" = "RunSpecifiedTests" ]; then
+          # Accept "A,B" or "A B" or "A, B": tr turns commas into spaces,
+          # then the unquoted $(...) is word-split on whitespace on purpose,
+          # giving one loop iteration per class name.
+          for test_class in $(echo "$TEST_CLASSES" | tr ',' ' '); do
+            # += appends to the array. Salesforce needs ONE --tests flag
+            # per class, e.g.  --tests AccountTest --tests OrderTest
+            TEST_ARGS+=(--tests "$test_class")
+          done
+        fi
+
+        # ------------------ DEPLOYMENT 1: package.xml -------------------
+        if has_types "$DELTA/package/package.xml"; then
+          echo "${ACTION} components from package.xml"
+          # sf project deploy start
+          #   --target-org   which org (the username we logged in with)
+          #   --dry-run      (only in validation) check-only, do not save
+          #   --manifest     deploy exactly the components listed in this
+          #                  package.xml. The source files are found by
+          #                  the project (sfdx-project.json) in the repo.
+          #   --test-level / --tests   see "APEX TESTS" in the header
+          #   --wait         block until Salesforce finishes (max N minutes)
+          #                  so the step's exit code reflects the real
+          #                  result. Without it the command returns at once
+          #                  and a failed deploy would go unnoticed.
+          # "${MODE_ARGS[@]}" expands the array into separate arguments
+          # (and to nothing when empty). The quotes keep each one intact.
+          sf project deploy start \
+            --target-org "$SF_USERNAME" \
+            "${MODE_ARGS[@]}" \
+            --manifest "$DELTA/package/package.xml" \
+            "${TEST_ARGS[@]}" \
+            --wait "$WAIT"
+        else
+          echo "No component changes in package.xml."
+        fi
+
+        # ------------- DEPLOYMENT 2: destructive changes ----------------
+        if has_types "$DELTA/destructiveChanges/destructiveChanges.xml"; then
+          if [ "$ALLOW_DESTRUCTIVE" = "true" ]; then
+            echo "${ACTION} destructive changes (post-destructive)"
+            # --post-destructive-changes : file listing components to delete,
+            #                              applied AFTER the deploy part.
+            # --manifest                 : the (empty) package.xml that must
+            #                              accompany a destructive deploy.
+            # Everything else is identical to deployment 1.
+            sf project deploy start \
+              --target-org "$SF_USERNAME" \
+              "${MODE_ARGS[@]}" \
+              --post-destructive-changes "$DELTA/destructiveChanges/destructiveChanges.xml" \
+              --manifest "$DELTA/destructiveChanges/package.xml" \
+              "${TEST_ARGS[@]}" \
+              --wait "$WAIT"
+          else
+            # Deletions were detected but the switch is off: make this
+            # impossible to miss, but do NOT fail (the rest was deployed).
+            # 1) yellow annotation on the run page
+            echo "::warning::⚠️ Destructive changes found in delta/destructiveChanges/destructiveChanges.xml but SKIPPED because ALLOW_DESTRUCTIVE_CHANGES is not 'true'."
+            # 2) banner in the raw log
+            echo "================================================================================"
+            echo "⚠️ [SKIPPED] DESTRUCTIVE CHANGES WERE NOT DEPLOYED / VALIDATED"
+            echo "Environment variable ALLOW_DESTRUCTIVE_CHANGES is set to '${ALLOW_DESTRUCTIVE}'."
+            echo "Components listed in delta/destructiveChanges/destructiveChanges.xml were NOT modified."
+            echo "You can inspect the destructive changes in the uploaded workflow delta artifact."
+            echo "================================================================================"
+            # 3) markdown note on the run Summary page. $GITHUB_STEP_SUMMARY
+            #    is a file path; "-n" tests that the variable is non-empty.
+            #    The backslash-escaped backticks (\`) are literal backticks
+            #    for markdown code formatting, not shell command syntax.
+            if [ -n "$GITHUB_STEP_SUMMARY" ]; then
+              {
+                echo "### ⚠️ Destructive Changes Skipped"
+                echo "> **Notice:** Destructive changes were detected in \`destructiveChanges.xml\` but were **skipped** because \`ALLOW_DESTRUCTIVE_CHANGES\` is set to \`false\`."
+                echo "> The files are safely stored in the **Delta Artifact** for audit and manual review."
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+        else
+          echo "No destructive changes."
+        fi

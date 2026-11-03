@@ -1,0 +1,87 @@
+# =====================================================================
+# Salesforce Code Analyzer v5 - CONFIGURATION
+# FILE : code-analyzer.yml  (repository root)
+# =====================================================================
+#
+# WHO READS THIS?
+#   "sf code-analyzer run" looks for a file named code-analyzer.yml (or
+#   .yaml) in the directory it is started from. The pipeline starts it from
+#   the repository root, so this file is picked up automatically - no flag is
+#   needed. (It is read from the root even though the scan itself is limited
+#   to the delta folder via --workspace.)
+#
+# WHAT DOES IT CONTROL?
+#   Settings of each analysis ENGINE under the top-level key "engines:".
+#   Every engine is ENABLED BY DEFAULT; an entry here only customises it.
+#
+# THINGS LEARNED FROM A REAL FAILED RUN (do not repeat):
+#   * The key to switch an engine off is   disable_engine: true
+#     NOT "disabled: true". An unknown key makes that engine fail to start
+#     with "UninstantiableEngineError ... invalid key 'disabled'" and the
+#     report then contains Critical errors about the tool itself.
+#   * Each engine accepts only its own keys, for example:
+#       pmd    : custom_rulesets, file_extensions, java_command,
+#                java_classpath_entries
+#       eslint : auto_discover_eslint_config, eslint_config_file,
+#                eslint_ignore_file, file_extensions,
+#                disable_javascript_base_config, disable_lwc_base_config, ...
+#       regex  : custom_rules
+#       retire-js : (no settings)
+#     PMD has NO "rule categories" key; categories are chosen inside an XML
+#     ruleset file, which is why .github/apex-ruleset.xml exists.
+#   * Run "sf code-analyzer config" locally to print every valid key.
+#
+# Full reference:
+#   https://developer.salesforce.com/docs/platform/salesforce-code-analyzer/guide/config-file.html
+# =====================================================================
+
+engines:
+  # -------------------------------------------------------------------
+  # PMD - static analysis of Apex (classes and triggers).
+  # Needs Java, which the GitHub Ubuntu runner already provides.
+  # -------------------------------------------------------------------
+  pmd:
+    # PMD rules are grouped in XML "rulesets". This points to our ruleset,
+    # which enables the six Apex categories (best practices, code style,
+    # design, error prone, performance, security). The path is relative to
+    # this config file. To silence one noisy rule, edit that XML file.
+    custom_rulesets:
+      - .github/apex-ruleset.xml
+
+  # -------------------------------------------------------------------
+  # ESLint - analysis of JavaScript in LWC / Aura bundles.
+  # -------------------------------------------------------------------
+  eslint:
+    # true = use the project's own ESLint configuration (eslint.config.js)
+    # in addition to the plugin's built-in Salesforce rules. That file needs
+    # node_modules, hence the "npm ci" step in the code-analysis action.
+    # NOTE (unverified): eslint.config.js sits in the repo root while the
+    # scan workspace is the delta/ folder. If ESLint findings ever look like
+    # they ignore project rules, check where discovery starts, or set
+    # eslint_config_file explicitly.
+    auto_discover_eslint_config: true
+
+  # -------------------------------------------------------------------
+  # RetireJS - looks for known-vulnerable JavaScript libraries.
+  # It has no settings; "{}" (an empty map) just documents "enabled with
+  # defaults". Removing this line changes nothing.
+  # -------------------------------------------------------------------
+  retire-js: {}
+
+  # -------------------------------------------------------------------
+  # Regex engine - custom text-pattern rules for any file type.
+  # Switched OFF: with no custom_rules defined there is nothing for it to do.
+  # To use it later, remove disable_engine and add rules under custom_rules.
+  # -------------------------------------------------------------------
+  regex:
+    disable_engine: true
+
+  # -------------------------------------------------------------------
+  # Flow analysis (Salesforce Flow best practices).
+  # The run log lists the Flow engine under the name "flow", so this
+  # "flow-scanner" key is probably not matched to any engine and has no
+  # effect. That is harmless because engines are on by default; it is kept
+  # only as a note. If Flow settings are ever needed, verify the exact engine
+  # key with: sf code-analyzer config
+  # -------------------------------------------------------------------
+  flow-scanner: {}

@@ -1,0 +1,86 @@
+# =====================================================================
+# COMPOSITE ACTION : calculate-delta
+# FILE             : .github/actions/calculate-delta/action.yml
+# =====================================================================
+#
+# PURPOSE:
+#   Produce the "delta": only the Salesforce components that changed
+#   between a starting commit (input from-sha) and HEAD.
+#
+# TOOL: sfdx-git-delta (SGD), installed by the setup-sf-cli action.
+#   Command: sf sgd source delta
+#   It runs "git diff" between two commits, understands Salesforce
+#   metadata (e.g. a changed .cls also needs its -meta.xml; a changed LWC
+#   file means the whole bundle), and writes:
+#
+#     delta/
+#       package/package.xml                      components to DEPLOY
+#       destructiveChanges/destructiveChanges.xml components to DELETE
+#       destructiveChanges/package.xml            empty manifest that must
+#                                                 accompany a destructive deploy
+#       force-app/...                             copies of the changed files
+#       delta-info.txt                            (written by us below)
+#
+# HOW THE TWO WORKFLOWS USE IT:
+#   Validation : from-sha = merge-base with the target branch
+#   Deployment : from-sha = commit of the deployed/<env> tag
+#   Both then call this same action - one place to fix, two pipelines fixed.
+#
+# NOTE: needs full git history (checkout with fetch-depth: 0) and the SGD
+# plugin already installed. No Salesforce login is needed for this step.
+# =====================================================================
+
+name: Calculate delta
+description: Runs sfdx-git-delta between a base commit and HEAD and writes the result to the delta folder.
+
+inputs:
+  from-sha:
+    description: Commit the delta starts from
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Generate delta
+      shell: bash
+      env:
+        FROM_SHA: ${{ inputs.from-sha }}
+      run: |
+        # Create the output folder. -p = do not complain if it exists.
+        mkdir -p delta
+
+        # sf sgd source delta
+        #   --from "$FROM_SHA"   start commit (exclusive: changes AFTER it)
+        #   --to HEAD            end commit = what is checked out right now
+        #   --output-dir delta   where to write package.xml etc.
+        #   --generate-delta     ALSO copy the changed source files into the
+        #                        output dir, so delta/ is a complete,
+        #                        deployable/inspectable mini-project.
+        sf sgd source delta --from "$FROM_SHA" --to HEAD --output-dir delta --generate-delta
+
+        # Write a small human-readable audit file next to the delta.
+        # { ...; } > file  redirects the output of the WHOLE group of
+        # commands into one file (instead of repeating >> on every line).
+        {
+          echo "delta from: ${FROM_SHA}"
+          # $(...) = command substitution: run it and insert its output.
+          echo "delta to: $(git rev-parse HEAD)"
+          # These GITHUB_* variables are set automatically by the runner;
+          # together they build a clickable URL of this very run.
+          echo "run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          echo "actor: ${GITHUB_ACTOR}"
+        } > delta/delta-info.txt
+
+        # Print everything into the job log so you can see the delta without
+        # downloading the artifact.
+        cat delta/delta-info.txt
+        for f in delta/package/package.xml delta/destructiveChanges/destructiveChanges.xml delta/destructiveChanges/package.xml; do
+          echo "----- $f -----"
+          # "cat file 2> /dev/null" hides the error if the file is absent;
+          # "|| echo (missing)" then prints a friendly marker instead of
+          # failing the step. It is only a defensive fallback: in practice
+          # SGD normally writes all three files, and when nothing was
+          # deleted the destructive files simply contain an empty <Package>
+          # with only a <version> tag (no <types>), as seen in real run logs.
+          cat "$f" 2> /dev/null || echo "(missing)"
+        done

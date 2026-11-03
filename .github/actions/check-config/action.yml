@@ -1,0 +1,123 @@
+# =====================================================================
+# COMPOSITE ACTION : check-config
+# FILE             : .github/actions/check-config/action.yml
+# =====================================================================
+#
+# WHAT IS A COMPOSITE ACTION?
+#   A composite action is a reusable "function" made of several steps. A
+#   workflow calls it like a normal step:
+#         - uses: ./.github/actions/check-config
+#           with: { ... inputs ... }
+#   It runs on the SAME runner VM and the SAME file system as the calling
+#   job (so files created earlier, like delta/, are visible). That is the
+#   difference from a "reusable workflow", which would be a separate job.
+#   We use composite actions so each workflow file still shows its full
+#   step-by-step sequence, while the repeated logic lives in one place.
+#
+# PURPOSE OF THIS ONE:
+#   FAIL FAST. If a secret or variable is missing from the GitHub
+#   Environment, stop in the first seconds with a clear message, instead of
+#   failing 5 minutes later with a cryptic Salesforce login error after the
+#   CLI has already been installed.
+#
+# WHY ARE SECRETS PASSED AS INPUTS?
+#   A composite action cannot read the "secrets" context by itself. The
+#   calling workflow reads ${{ secrets.X }} and hands it over as an input.
+#
+# USED BY: salesforce-validation.yml and salesforce-deployment.yml.
+# =====================================================================
+
+name: Check environment configuration
+description: Fails early when a required secret or variable is missing in the GitHub Environment.
+
+# ---------------------------------------------------------------------
+# INPUTS = the parameters of this "function". Always arrive as strings.
+# "required: true" is only documentation/validation by GitHub; the real
+# emptiness check is done by the shell script below.
+# ---------------------------------------------------------------------
+inputs:
+  environment:
+    description: GitHub Environment name
+    required: true
+  username:
+    description: Salesforce username
+    required: true
+  instance-url:
+    description: Salesforce login/instance URL
+    required: true
+  client-id:
+    description: Connected App consumer key
+    required: true
+  jwt-key:
+    description: Private key content for the JWT flow
+    required: true
+  test-level:
+    description: NoTestRun, RunLocalTests, RunSpecifiedTests or RunAllTestsInOrg
+    required: true
+  test-classes:
+    description: Comma or space separated test classes (needed for RunSpecifiedTests)
+    # Optional: only needed for RunSpecifiedTests.
+    required: false
+    default: ""
+
+runs:
+  # "composite" = this action is a list of steps (not Docker, not JavaScript).
+  using: composite
+  steps:
+    - name: Check required secrets and variables
+      # Every "run:" step in a composite action MUST declare its shell.
+      # (Normal workflow steps default to bash on Linux; composite ones
+      # have no default.) GitHub then runs: bash --noprofile --norc -e
+      # -o pipefail {0}  i.e. stop on first error AND on errors inside pipes.
+      shell: bash
+      # Inputs are copied into environment variables and read as $NAME in
+      # the script. We never paste ${{ inputs.x }} straight into the script
+      # text, because a value containing quotes or shell syntax could then
+      # be executed as code ("script injection"). env: is the safe way.
+      env:
+        TARGET_ENV: ${{ inputs.environment }}
+        SF_USERNAME: ${{ inputs.username }}
+        SF_INSTANCE_URL: ${{ inputs.instance-url }}
+        CLIENT_ID: ${{ inputs.client-id }}
+        JWT_KEY: ${{ inputs.jwt-key }}
+        TEST_LEVEL: ${{ inputs.test-level }}
+        TEST_CLASSES: ${{ inputs.test-classes }}
+      run: |
+        # missing is a flag. We do NOT exit at the first problem; we check
+        # every name so the user sees ALL missing values in one run instead
+        # of fixing them one at a time.
+        missing=0
+        for name in SF_USERNAME SF_INSTANCE_URL CLIENT_ID JWT_KEY TEST_LEVEL; do
+          # ${!name} = "indirect expansion": the value of the variable whose
+          # NAME is stored in $name. When name=CLIENT_ID this reads $CLIENT_ID.
+          # -z tests "is the string empty?".
+          if [ -z "${!name}" ]; then
+            # ::error:: is a GitHub workflow command -> red annotation.
+            # The secret VALUE is never printed, only its name.
+            echo "::error::'$name' is not configured in GitHub environment '$TARGET_ENV'."
+            missing=1
+          fi
+        done
+        # "[ cond ] || exit 1" = if cond is false then exit with failure.
+        # Fails the step (and the job) if anything was missing.
+        [ "$missing" -eq 0 ] || exit 1
+
+        # Validate TEST_LEVEL against the four values Salesforce accepts.
+        case "$TEST_LEVEL" in
+          # Nothing extra needed for these three.
+          NoTestRun|RunLocalTests|RunAllTestsInOrg) ;;
+          RunSpecifiedTests)
+            # This level REQUIRES a list of class names, otherwise
+            # Salesforce rejects the deployment later. Catch it now.
+            if [ -z "$TEST_CLASSES" ]; then
+              echo "::error::TEST_LEVEL is RunSpecifiedTests but TEST_CLASSES is empty in environment '$TARGET_ENV'."
+              exit 1
+            fi
+            ;;
+          *)
+            # Anything else is a typo (e.g. "RunLocaltests").
+            echo "::error::Invalid TEST_LEVEL '$TEST_LEVEL'."
+            exit 1
+            ;;
+        esac
+        echo "Configuration for '$TARGET_ENV' looks complete."

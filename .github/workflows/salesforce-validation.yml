@@ -1,0 +1,351 @@
+# =====================================================================
+# WORKFLOW : Salesforce Validation  (the "pull request check")
+# FILE     : .github/workflows/salesforce-validation.yml
+# =====================================================================
+#
+# ---------------------------------------------------------------------
+# 1. WHAT IS THIS FILE? (read this first)
+# ---------------------------------------------------------------------
+# A GitHub Actions *workflow* is a YAML file stored in .github/workflows/.
+# GitHub watches for the events listed under "on:" and, when one happens,
+# starts a fresh virtual machine (the "runner"), checks out the code and
+# executes the steps below, top to bottom.
+#
+# THIS workflow answers one question for the code reviewer:
+#     "If I merge this pull request, will it deploy cleanly to the
+#      Salesforce org that belongs to the target branch?"
+# It answers WITHOUT changing anything in the org. Salesforce calls this a
+# "check-only" / "validation" deployment (CLI flag: --dry-run). The org
+# compiles the code, checks dependencies and runs Apex tests, then throws
+# the result away. The green tick / red cross shows up on the PR.
+#
+# It additionally runs Salesforce Code Analyzer (static code analysis) on
+# the changed files and attaches an HTML report. That part is informational
+# only and can never fail the pipeline.
+#
+# ---------------------------------------------------------------------
+# 2. HIGH LEVEL FLOW (the order of the steps in this file)
+# ---------------------------------------------------------------------
+#   PR opened / updated
+#        |
+#        v
+#   (1) Checkout code (full git history)
+#   (2) Check that all secrets/variables exist     -> fail early, clear msg
+#   (3) Install Salesforce CLI + sfdx-git-delta
+#   (4) Find the "delta base" (merge-base with target branch)
+#   (5) Calculate the delta (only what THIS PR changes)
+#   (6) Upload the delta as a downloadable artifact
+#   (7) Optional notice if validation is switched off
+#   (8) Login to the Salesforce org (JWT)
+#   (9) Dry-run deploy the delta  (this is the real "validation")
+#   (10) Code analysis on the delta (always runs, never fails the build)
+#
+# ---------------------------------------------------------------------
+# 3. WHAT IS A "DELTA" AND WHY DO WE USE IT?
+# ---------------------------------------------------------------------
+# A Salesforce repo can contain thousands of components. Deploying all of
+# them on every PR would be slow (tests!) and risky. A "delta" is only the
+# set of components that were added / changed / deleted by the PR.
+# The tool sfdx-git-delta ("SGD") compares two git commits and writes:
+#     delta/package/package.xml                   -> what to deploy
+#     delta/destructiveChanges/destructiveChanges.xml -> what to delete
+#     delta/force-app/...                          -> copies of changed files
+# Steps (4) and (5) below produce it.
+#
+# ---------------------------------------------------------------------
+# 4. ON / OFF SWITCHES (set per GitHub Environment, no code change needed)
+# ---------------------------------------------------------------------
+# GitHub > Settings > Environments > <env> > Variables
+#   IS_RUN_VALIDATION     = false  -> skip login + dry-run deploy (step 7-9)
+#   IS_RUN_CODE_ANALYSIS  = false  -> skip code analysis (step 10)
+#   ALLOW_DESTRUCTIVE_CHANGES = true -> also validate deletions
+#   SF_CLI_VERSION / SGD_VERSION     -> pin tool versions (default: latest)
+# Switch pattern used everywhere in this repo: the feature is ON by
+# default; ONLY the exact lowercase string 'false' turns it OFF. If the
+# variable does not exist at all, the feature stays ON.
+#
+# ---------------------------------------------------------------------
+# 5. KNOWN GOTCHAS (learned the hard way, keep for the future)
+# ---------------------------------------------------------------------
+# * "paths:" filter below: if a PR changes ONLY files outside force-app and
+#   .github, this workflow does not start at all. If you mark this check as
+#   "required" in branch protection, such a PR would wait forever for a
+#   check that never runs. Either keep the filter broad or do not require
+#   the check for those branches.
+# * A PR that has merge conflicts gets NO run: GitHub cannot build the test
+#   merge commit that this workflow checks out. Resolve conflicts first.
+# * TEST_LEVEL=RunLocalTests runs EVERY Apex test in the org. A failing,
+#   data-dependent test (e.g. DUPLICATE_VALUE) or <75% org coverage fails the
+#   validation. For a dev sandbox use TEST_LEVEL=NoTestRun.
+# * A job that sits at "Starting job.." is waiting for a runner machine. That
+#   is GitHub/Enterprise capacity, not a problem in this file.
+# =====================================================================
+
+name: Salesforce Validation
+
+# ---------------------------------------------------------------------
+# TRIGGER
+# ---------------------------------------------------------------------
+on:
+  # "pull_request" fires for pull requests. IMPORTANT BEHAVIOUR: for this
+  # event GitHub does not check out the feature branch tip. It builds a
+  # temporary "test merge" commit (feature branch merged into the target
+  # branch) at refs/pull/<number>/merge and checks THAT out. So we validate
+  # exactly what the code will look like after the merge.
+  pull_request:
+    # Only PRs whose TARGET (base) branch is one of these. The feature
+    # branch name does not matter. Each target branch maps to one GitHub
+    # Environment / Salesforce org (main -> production, others -> same name).
+    branches: [main, uat, qa, int, dev]
+    # Only start if the PR touches Salesforce source or the pipeline
+    # itself. ".github/**" includes workflows and composite actions, so a
+    # change to the pipeline gets validated by the pipeline. (See gotcha
+    # about required checks in the header.)
+    paths: ["force-app/**", ".github/**"]
+    # opened      = new PR
+    # synchronize = new commits pushed to the PR branch
+    # reopened    = PR closed and opened again
+    # (default types are exactly these three; listed explicitly for clarity)
+    types: [opened, synchronize, reopened]
+
+# ---------------------------------------------------------------------
+# PERMISSIONS of the automatic GITHUB_TOKEN
+# ---------------------------------------------------------------------
+# Principle of least privilege. Validation only needs to READ the repo
+# (checkout). It never pushes, comments or tags, so write access is not
+# granted. If a step is ever compromised it cannot modify the repository.
+permissions:
+  contents: read
+
+# ---------------------------------------------------------------------
+# CONCURRENCY (avoid duplicate / stale runs)
+# ---------------------------------------------------------------------
+# Runs that share the same "group" string are not allowed to run at the same
+# time. The group here is one per pull request number.
+# cancel-in-progress: true -> when a developer pushes a new commit while the
+# previous validation is still running, the OLD run is cancelled and only
+# the newest commit is validated. This saves runner minutes and avoids two
+# validations hitting the same Salesforce org at the same moment (which can
+# cause "UNABLE_TO_LOCK_ROW" or "deployment already in progress" errors).
+concurrency:
+  group: validate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  # "validate" is the job id (internal name). A workflow can have many jobs;
+  # here we have exactly one, so every step shares the same runner VM and
+  # the same file system (the delta/ folder created in step 5 is visible in
+  # step 9 and step 10).
+  validate:
+    # The display name; also used as the status-check name on the PR.
+    # Renaming it requires updating branch protection rules.
+    # Expression logic: if the PR targets "main" show "production", else show
+    # the branch name itself (dev, int, qa, uat).
+    name: Validate to ${{ github.base_ref == 'main' && 'production' || github.base_ref }}
+    # A GitHub-hosted Ubuntu virtual machine. "latest" moves forward over
+    # time (currently Ubuntu 24.04). Pin e.g. ubuntu-24.04 for stability.
+    runs-on: ubuntu-latest
+    # Binds the job to a GitHub ENVIRONMENT. This does three things:
+    #   a) makes the environment's secrets and variables available as
+    #      secrets.* and vars.* (same names, different values per org),
+    #   b) applies the environment's protection rules (required reviewers,
+    #      wait timer, allowed branches) BEFORE the job starts,
+    #   c) records a deployment entry in the repo's Deployments page.
+    # Same "main -> production" naming rule as above.
+    environment: ${{ github.base_ref == 'main' && 'production' || github.base_ref }}
+    # Job-level environment variable visible to every step as env.TARGET_ENV
+    # (and as $TARGET_ENV inside shell scripts). Computed once here so that
+    # we do not repeat the long expression in every step.
+    env:
+      TARGET_ENV: ${{ github.base_ref == 'main' && 'production' || github.base_ref }}
+
+    steps:
+      # =================================================================
+      # STEP 1 - CHECKOUT
+      # =================================================================
+      # Copies the repository onto the runner. The runner starts EMPTY, so
+      # nothing else works before this. It must also come first because the
+      # local composite actions (./.github/actions/...) are read from disk.
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          # fetch-depth: 0 = download the COMPLETE history of ALL branches
+          # and tags. The default (1) downloads only the latest commit,
+          # which would make "git merge-base" and the sfdx-git-delta diff
+          # impossible because the older commits would be missing.
+          fetch-depth: 0
+
+      # =================================================================
+      # STEP 2 - FAIL FAST ON MISSING CONFIGURATION
+      # =================================================================
+      # Checks that every required secret/variable exists and that
+      # TEST_LEVEL is valid. Without this, a missing value would only show
+      # up minutes later as a confusing Salesforce login error.
+      # Secrets and vars are passed as INPUTS because a composite action
+      # cannot read the "secrets" context directly. Implementation:
+      # .github/actions/check-config/action.yml
+      - name: Check environment configuration
+        uses: ./.github/actions/check-config
+        with:
+          environment: ${{ env.TARGET_ENV }}
+          username: ${{ vars.USERNAME }}
+          instance-url: ${{ vars.INSTANCE_URL }}
+          client-id: ${{ secrets.CLIENT_ID }}
+          jwt-key: ${{ secrets.JWT_KEY_FILE_CONTENT }}
+          test-level: ${{ vars.TEST_LEVEL }}
+          test-classes: ${{ vars.TEST_CLASSES }}
+
+      # =================================================================
+      # STEP 3 - INSTALL TOOLS
+      # =================================================================
+      # Installs the Salesforce CLI ("sf") and the sfdx-git-delta plugin.
+      # "vars.X || 'latest'" means: use the variable if it is set, otherwise
+      # fall back to 'latest'. Pin a version (e.g. 2.80.8) in the GitHub
+      # Environment once stable so a new CLI release cannot break a run.
+      # Implementation: .github/actions/setup-sf-cli/action.yml
+      - name: Setup Salesforce CLI and sfdx-git-delta
+        uses: ./.github/actions/setup-sf-cli
+        with:
+          cli-version: ${{ vars.SF_CLI_VERSION || 'latest' }}
+          sgd-version: ${{ vars.SGD_VERSION || 'latest' }}
+
+      # =================================================================
+      # STEP 4 - FIND THE DELTA BASE
+      # =================================================================
+      # The delta is "everything between commit A and commit B". B is HEAD
+      # (the test-merge commit). A is the BASE we compute here.
+      #
+      # git merge-base X Y = the most recent commit that both X and Y share
+      # (their common ancestor). With X = origin/<target branch>, and HEAD
+      # being the test-merge of the PR into that branch, the common ancestor
+      # is the current tip of the target branch. So delta = exactly the
+      # changes THIS PR brings in, even if the feature branch is old.
+      #
+      # Why not the branch-off commit? It would also include changes that were
+      # merged into the target meanwhile by other people (false changes).
+      # Why not origin/<target> directly? If the target moves while the job
+      # runs, the diff could show reversed changes. merge-base is stable.
+      #
+      # "id: base" lets later steps read this step's outputs through
+      # steps.base.outputs.sha .
+      - name: Find delta base (merge-base with target branch)
+        id: base
+        # No "shell:" given, so GitHub uses its default "bash -e {0}"
+        # (stop on first error, but WITHOUT -o pipefail).
+        run: |
+          # github.base_ref is the target branch name of the PR (e.g. dev).
+          # The "origin/" prefix is the remote-tracking copy that checkout
+          # downloaded (possible only because fetch-depth is 0).
+          BASE_SHA=$(git merge-base "origin/${{ github.base_ref }}" HEAD)
+          echo "Delta base: ${BASE_SHA}"
+          # Writing "name=value" lines into the file whose path is in
+          # $GITHUB_OUTPUT is the modern way to return a value to later
+          # steps (the old ::set-output command is deprecated).
+          echo "sha=${BASE_SHA}" >> "$GITHUB_OUTPUT"
+
+      # =================================================================
+      # STEP 5 - CALCULATE THE DELTA
+      # =================================================================
+      # Runs sfdx-git-delta between the base SHA and HEAD and writes the
+      # result into the delta/ folder (package.xml, destructiveChanges.xml,
+      # copies of changed sources, delta-info.txt).
+      # Implementation: .github/actions/calculate-delta/action.yml
+      - name: Calculate delta
+        uses: ./.github/actions/calculate-delta
+        with:
+          from-sha: ${{ steps.base.outputs.sha }}
+
+      # =================================================================
+      # STEP 6 - KEEP THE DELTA AS AN ARTIFACT
+      # =================================================================
+      # An artifact is a file/folder GitHub stores after the run ends; you can
+      # download it from the run summary page. Useful to audit exactly what
+      # was validated, or to re-deploy it manually.
+      - name: Upload delta artifact
+        # always() = run this step even if an earlier step failed. We WANT the
+        # delta even (especially) when the validation fails, for debugging.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          # Name must be unique per run. It carries: type-environment-commit
+          # -run id-attempt (attempt increases when you click "Re-run").
+          # github.sha on a pull_request run is the TEST MERGE commit.
+          name: validate-${{ env.TARGET_ENV }}-${{ github.sha }}-run${{ github.run_id }}-${{ github.run_attempt }}
+          path: delta/
+          # Days GitHub keeps it (organisation settings can cap this lower).
+          retention-days: 90
+          # warn = do not fail if the folder is missing (e.g. delta step died).
+          if-no-files-found: warn
+
+      # =================================================================
+      # STEP 7 - EMERGENCY SWITCH NOTICE
+      # =================================================================
+      # When IS_RUN_VALIDATION is exactly 'false', steps 8 and 9 are skipped.
+      # This step makes that very visible so nobody mistakes a skipped
+      # validation for a successful one (the job still ends green!).
+      - name: Validation switched off
+        if: ${{ vars.IS_RUN_VALIDATION == 'false' }}
+        run: |
+          # "::warning::" is a workflow command: it creates a yellow
+          # annotation on the run page.
+          echo "::warning::Validation skipped because IS_RUN_VALIDATION is false in environment '${{ env.TARGET_ENV }}'."
+          # $GITHUB_STEP_SUMMARY is a file; markdown written to it is shown
+          # on the run's Summary page.
+          echo "### Validation skipped (IS_RUN_VALIDATION=false)" >> "$GITHUB_STEP_SUMMARY"
+
+      # =================================================================
+      # STEP 8 - LOGIN TO SALESFORCE (JWT)
+      # =================================================================
+      # JWT bearer flow = non-interactive login for automation. The runner
+      # signs a token with a private key; the Salesforce Connected App
+      # (identified by CLIENT_ID) trusts the matching certificate. No
+      # password, no browser, no MFA prompt.
+      # "!= 'false'" implements the "ON unless exactly false" rule.
+      # Implementation: .github/actions/sf-login/action.yml
+      - name: Login to Salesforce
+        if: ${{ vars.IS_RUN_VALIDATION != 'false' }}
+        uses: ./.github/actions/sf-login
+        with:
+          client-id: ${{ secrets.CLIENT_ID }}
+          jwt-key: ${{ secrets.JWT_KEY_FILE_CONTENT }}
+          username: ${{ vars.USERNAME }}
+          instance-url: ${{ vars.INSTANCE_URL }}
+
+      # =================================================================
+      # STEP 9 - THE ACTUAL VALIDATION (dry-run deploy)
+      # =================================================================
+      # Sends the delta to the org with --dry-run: Salesforce does all the
+      # work (compile, dependency check, run tests) but commits nothing.
+      # If this step exits non-zero the PR check turns red.
+      # Implementation: .github/actions/sf-deploy/action.yml
+      - name: Validate delta (dry-run)
+        if: ${{ vars.IS_RUN_VALIDATION != 'false' }}
+        uses: ./.github/actions/sf-deploy
+        with:
+          username: ${{ vars.USERNAME }}
+          # Inputs are always strings, hence the quotes: "true" not true.
+          dry-run: "true"
+          # NoTestRun | RunLocalTests | RunSpecifiedTests | RunAllTestsInOrg
+          test-level: ${{ vars.TEST_LEVEL }}
+          # Only used when TEST_LEVEL is RunSpecifiedTests.
+          test-classes: ${{ vars.TEST_CLASSES }}
+          # Deleting metadata is dangerous, so it is OFF unless the
+          # environment explicitly sets ALLOW_DESTRUCTIVE_CHANGES=true.
+          allow-destructive: ${{ vars.ALLOW_DESTRUCTIVE_CHANGES || 'false' }}
+
+      # =================================================================
+      # STEP 10 - CODE ANALYSIS (informational, never blocks the PR)
+      # =================================================================
+      # Runs Salesforce Code Analyzer v5 (PMD for Apex, ESLint for LWC/Aura
+      # JS, RetireJS, Flow scanner ...) ONLY on the delta files and uploads an
+      # HTML report as an artifact for the reviewer to download and share.
+      - name: Code analysis (Salesforce Code Analyzer)
+        # always() = run even if the validation failed or was skipped, so the
+        # reviewer gets the report regardless of the deploy result.
+        if: always()
+        uses: ./.github/actions/code-analysis
+        with:
+          # Converts the variable to a clean 'true'/'false' string:
+          # 'false' only when IS_RUN_CODE_ANALYSIS is exactly 'false'.
+          run-code-analysis: ${{ vars.IS_RUN_CODE_ANALYSIS != 'false' && 'true' || 'false' }}
+          delta-path: delta

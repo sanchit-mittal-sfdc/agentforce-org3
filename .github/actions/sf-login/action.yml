@@ -1,0 +1,118 @@
+# =====================================================================
+# COMPOSITE ACTION : sf-login
+# FILE             : .github/actions/sf-login/action.yml
+# =====================================================================
+#
+# PURPOSE:
+#   Authenticate the Salesforce CLI against ONE org, without any human,
+#   password, browser or MFA prompt, and make that org the default target
+#   for later "sf" commands in the same job.
+#
+# HOW JWT BEARER FLOW WORKS (the "why"):
+#   One-time setup (done by an admin, not by this pipeline):
+#     1. Generate an RSA key pair. The PRIVATE key stays secret
+#        (stored as the GitHub secret JWT_KEY_FILE_CONTENT).
+#        The PUBLIC certificate is uploaded to a Salesforce Connected App.
+#     2. The Connected App has "Use digital signatures" enabled, the right
+#        OAuth scopes, and the integration user is pre-authorised for it
+#        (profile/permission set). Its Consumer Key is the CLIENT_ID.
+#   Each run:
+#     3. The CLI builds a small token (JWT) saying "I am <username>, for
+#        app <client id>", signs it with the private key and sends it to
+#        <instance-url>.
+#     4. Salesforce verifies the signature with the stored certificate and
+#        returns an access token. No password ever travels.
+#
+# SECURITY HANDLING OF THE PRIVATE KEY (important):
+#   The CLI wants the key as a FILE. We therefore
+#     - create a unique temp file in $RUNNER_TEMP (mktemp),
+#     - restrict it to the owner only (chmod 600),
+#     - write the key into it,
+#     - and ALWAYS delete it at the end, even when login fails (trap EXIT).
+#   The key is never echoed to the log (GitHub also masks secrets).
+#
+# instance-url:
+#   https://login.salesforce.com  -> production / developer edition
+#   https://test.salesforce.com   -> sandboxes
+#   or the org's My Domain URL (this project uses My Domain URLs).
+# =====================================================================
+
+name: Salesforce JWT login
+description: Logs in to the Salesforce org with the JWT flow and sets it as the default org.
+
+inputs:
+  client-id:
+    description: Connected App consumer key
+    required: true
+  jwt-key:
+    description: Private key content
+    required: true
+  username:
+    description: Salesforce username
+    required: true
+  instance-url:
+    description: Salesforce login/instance URL
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Login with JWT
+      shell: bash
+      # Secrets are handed to the script as environment variables, never
+      # pasted into the script text. This keeps them out of the printed
+      # command line and prevents injection.
+      env:
+        CLIENT_ID: ${{ inputs.client-id }}
+        JWT_KEY: ${{ inputs.jwt-key }}
+        SF_USERNAME: ${{ inputs.username }}
+        SF_INSTANCE_URL: ${{ inputs.instance-url }}
+      run: |
+        # mktemp creates a new, empty file with a UNIQUE random name; the
+        # XXXXXX is replaced by random characters. $RUNNER_TEMP is a private
+        # scratch folder that the runner cleans up after the job.
+        KEY_FILE="$(mktemp "${RUNNER_TEMP}/jwt.XXXXXX")"
+
+        # A shell function that deletes the key file. Defined BEFORE it is
+        # needed so the trap below can call it.
+        cleanup() {
+          # -f = "is it an existing regular file?"
+          if [ -f "$KEY_FILE" ]; then
+            # rm -f = remove without prompting; its exit code decides
+            # which message is printed.
+            if rm -f "$KEY_FILE"; then
+              echo "Key file successfully deleted: $KEY_FILE"
+            else
+              # >&2 = print to standard ERROR (stderr).
+              echo "Failed to delete key file: $KEY_FILE" >&2
+            fi
+          fi
+        }
+        # trap <command> EXIT = run that command whenever the script ends,
+        # for ANY reason: normal end, "exit 1", or an error under "-e".
+        # This is what guarantees the key never stays on disk.
+        trap cleanup EXIT
+
+        # Owner read/write only (octal 600). Do this BEFORE writing the key
+        # so there is no moment when other users could read it.
+        chmod 600 "$KEY_FILE"
+        # printf '%s\n' prints the value exactly as is plus one newline.
+        # (Safer than echo, which may interpret backslashes in the key.)
+        printf '%s\n' "$JWT_KEY" > "$KEY_FILE"
+
+        # sf org login jwt
+        #   --client-id      Connected App consumer key
+        #   --jwt-key-file   path to the private key file we just wrote
+        #   --username       the integration user to log in as
+        #   --instance-url   which Salesforce login host to talk to
+        #   --set-default    make this the default org, so later commands do
+        #                    not need --target-org each time
+        sf org login jwt \
+          --client-id "$CLIENT_ID" \
+          --jwt-key-file "$KEY_FILE" \
+          --username "$SF_USERNAME" \
+          --instance-url "$SF_INSTANCE_URL" \
+          --set-default
+        # Show the connected orgs in the log as a quick sanity check
+        # (alias/username/org id/status "Connected"). Contains no secrets.
+        sf org list

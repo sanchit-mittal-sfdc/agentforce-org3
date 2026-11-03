@@ -1,0 +1,324 @@
+# =====================================================================
+# WORKFLOW : Salesforce Deployment  (manual, button-click deploy)
+# FILE     : .github/workflows/salesforce-deployment.yml
+# =====================================================================
+#
+# ---------------------------------------------------------------------
+# 1. WHAT IS THIS FILE?
+# ---------------------------------------------------------------------
+# This workflow REALLY deploys (or dry-runs) the changes of a branch to the
+# Salesforce org that belongs to that branch. Unlike the validation
+# workflow it is NEVER triggered automatically: a human opens
+#     GitHub > Actions > "Salesforce Deployment" > Run workflow
+# picks the branch + the mode and clicks the button. There is deliberately
+# NO deploy-on-push, so nothing reaches an org without a conscious action.
+#
+# ---------------------------------------------------------------------
+# 2. HIGH LEVEL FLOW
+# ---------------------------------------------------------------------
+#   Human clicks "Run workflow" (branch = dev|int|qa|uat|main, mode)
+#        |
+#        v
+#   (1) Is this user on the allow-list?         -> else fail
+#   (2) Checkout code (full history + tags)
+#   (3) Check secrets/variables exist
+#   (4) Install Salesforce CLI + sfdx-git-delta
+#   (5) Find the delta base = last deployed commit (git tag or manual SHA)
+#   (6) Calculate delta (base -> HEAD)
+#   (7) Upload delta as artifact
+#   (8) Login to Salesforce (JWT)
+#   (9) Deploy (or dry-run) the delta
+#   (10) Move the "deployed/<env>" git tag to HEAD   (only on real success)
+#
+# ---------------------------------------------------------------------
+# 3. THE KEY IDEA: "WHAT HAS ALREADY BEEN DEPLOYED?" = A GIT TAG
+# ---------------------------------------------------------------------
+# To deploy only the NEW changes we must know which commit is currently live
+# in each org. We store that as an annotated git tag named
+#     deployed/<environment>      e.g. deployed/dev, deployed/production
+# Delta = (commit the tag points to) .. HEAD.
+# The tag moves ONLY after a successful real deployment. So if a deploy
+# fails, or somebody forgets to deploy, nothing is lost: the next run
+# starts from the same old tag and includes everything not yet deployed.
+# (A naive "HEAD~1..HEAD" would only see the last commit and silently skip
+# earlier un-deployed ones - that is exactly the bug the tag avoids.)
+# First-ever deploy of an environment has no tag yet; see the
+# resolve-deploy-base action for the manual-SHA escape hatch.
+#
+# ---------------------------------------------------------------------
+# 4. CONFIGURATION (GitHub > Settings > Environments > <env>)
+# ---------------------------------------------------------------------
+#  Secrets  : CLIENT_ID, JWT_KEY_FILE_CONTENT
+#  Variables: USERNAME, INSTANCE_URL, TEST_LEVEL, TEST_CLASSES (optional),
+#             DEPLOY_ALLOWED_USERS  (comma separated GitHub usernames),
+#             ALLOW_DESTRUCTIVE_CHANGES, DELTA_USE_MANUAL_FROM_SHA,
+#             DELTA_MANUAL_FROM_SHA, SF_CLI_VERSION, SGD_VERSION
+#
+# ---------------------------------------------------------------------
+# 5. KNOWN GOTCHAS
+# ---------------------------------------------------------------------
+# * The BRANCH you pick in "Use workflow from" decides the environment.
+#   Picking a feature branch makes the job skip itself (see job "if:").
+# * Salesforce forbids TEST_LEVEL=NoTestRun for production deployments that
+#   contain Apex. Use RunLocalTests / RunSpecifiedTests for production.
+# * After using DELTA_USE_MANUAL_FROM_SHA set it back to false, otherwise
+#   every future deploy keeps starting from that old SHA.
+# =====================================================================
+
+name: Salesforce Deployment
+
+# ---------------------------------------------------------------------
+# TRIGGER
+# ---------------------------------------------------------------------
+on:
+  # workflow_dispatch = "manual trigger" (the Run workflow button / API).
+  workflow_dispatch:
+    # Form fields shown to the person who clicks the button.
+    inputs:
+      mode:
+        description: "Deployment mode"
+        # "choice" renders a dropdown. Values arrive as strings.
+        type: choice
+        options:
+          # deploy  = real deployment, changes are saved, tag is moved.
+          - deploy
+          # dry-run = validate only (--dry-run), nothing saved, tag NOT moved.
+          - dry-run
+        default: deploy
+
+# ---------------------------------------------------------------------
+# PERMISSIONS
+# ---------------------------------------------------------------------
+# Unlike validation, this workflow must PUSH a git tag in the last step, and
+# pushing needs write access to repository contents. Granted explicitly so
+# it works even if the repo default for GITHUB_TOKEN is read-only.
+permissions:
+  contents: write
+
+# ---------------------------------------------------------------------
+# CONCURRENCY
+# ---------------------------------------------------------------------
+# One deployment per branch (= per org) at a time.
+# cancel-in-progress: false is CRITICAL here: cancelling a deployment
+# half-way (unlike a validation) could leave the org partly deployed and the
+# tag out of sync. A second run therefore WAITS in the queue until the
+# first finishes instead of killing it.
+concurrency:
+  group: deploy-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # github.ref_name = the branch picked in "Use workflow from".
+    name: Deploy to ${{ github.ref_name == 'main' && 'production' || github.ref_name }}
+    # Safety net: only the five environment branches may deploy. For any
+    # other branch the whole job is skipped (shows as "skipped", not failed).
+    # fromJSON turns the JSON text into an array so contains() can search it.
+    if: ${{ contains(fromJSON('["main","uat","qa","int","dev"]'), github.ref_name) }}
+    runs-on: ubuntu-latest
+    # Binds to the GitHub Environment (secrets, vars, protection rules).
+    # main -> "production", otherwise the branch name.
+    environment: ${{ github.ref_name == 'main' && 'production' || github.ref_name }}
+    env:
+      TARGET_ENV: ${{ github.ref_name == 'main' && 'production' || github.ref_name }}
+      # Converts the dropdown text into a clean 'true'/'false' flag that the
+      # sf-deploy action and the tag step understand.
+      DRY_RUN_MODE: ${{ github.event.inputs.mode == 'dry-run' && 'true' || 'false' }}
+
+    steps:
+      # =================================================================
+      # STEP 1 - WHO MAY DEPLOY? (authorisation gate)
+      # =================================================================
+      # Anybody with write access can click "Run workflow". This step makes
+      # sure only the people listed in the environment variable
+      # DEPLOY_ALLOWED_USERS (e.g. "alice,bob") can proceed. It is first so
+      # an unauthorised user wastes no time and gets no access to anything.
+      - name: Check who is allowed to deploy
+        # Values go through env: instead of being pasted into the script
+        # text. This prevents "script injection" (a malicious value being
+        # executed as shell code).
+        env:
+          ALLOWED_USERS: ${{ vars.DEPLOY_ALLOWED_USERS }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          # ${VAR,,} = lower-case the value (bash 4), so matching ignores case.
+          # We wrap both sides in commas: ",alice,bob," contains ",alice,".
+          # That makes "ali" NOT match "alice" (no partial-name matches).
+          # case ... esac = shell pattern matching; * = anything.
+          case ",${ALLOWED_USERS,,}," in
+            *",${ACTOR,,},"*) echo "'${ACTOR}' is allowed to deploy to ${TARGET_ENV}." ;;
+            *)
+              # ::error:: creates a red annotation. exit 1 fails the job.
+              # Also fails when the variable is not set at all (safe default).
+              echo "::error::'${ACTOR}' is not in DEPLOY_ALLOWED_USERS of environment '${TARGET_ENV}' (or the variable is not set)."
+              exit 1
+              ;;
+          esac
+
+      # =================================================================
+      # STEP 2 - CHECKOUT (with full history AND tags)
+      # =================================================================
+      # fetch-depth: 0 downloads all commits and all tags. We need the tags
+      # because the delta base is the deployed/<env> tag, and we need the
+      # history to diff old..new.
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      # =================================================================
+      # STEP 3 - FAIL FAST ON MISSING CONFIGURATION
+      # =================================================================
+      # Same check as in validation. See .github/actions/check-config.
+      - name: Check environment configuration
+        uses: ./.github/actions/check-config
+        with:
+          environment: ${{ env.TARGET_ENV }}
+          username: ${{ vars.USERNAME }}
+          instance-url: ${{ vars.INSTANCE_URL }}
+          client-id: ${{ secrets.CLIENT_ID }}
+          jwt-key: ${{ secrets.JWT_KEY_FILE_CONTENT }}
+          test-level: ${{ vars.TEST_LEVEL }}
+          test-classes: ${{ vars.TEST_CLASSES }}
+
+      # =================================================================
+      # STEP 4 - INSTALL TOOLS
+      # =================================================================
+      # Salesforce CLI + sfdx-git-delta. See .github/actions/setup-sf-cli.
+      - name: Setup Salesforce CLI and sfdx-git-delta
+        uses: ./.github/actions/setup-sf-cli
+        with:
+          cli-version: ${{ vars.SF_CLI_VERSION || 'latest' }}
+          sgd-version: ${{ vars.SGD_VERSION || 'latest' }}
+
+      # =================================================================
+      # STEP 5 - FIND THE DELTA BASE (last deployed commit)
+      # =================================================================
+      # Resolution order (details in .github/actions/resolve-deploy-base):
+      #   1. DELTA_USE_MANUAL_FROM_SHA == 'true'  -> use DELTA_MANUAL_FROM_SHA
+      #   2. otherwise the tag deployed/<environment>
+      #   3. neither exists -> FAIL (never guess)
+      # Its output "sha" is read below via steps.base.outputs.sha.
+      - name: Find delta base (last deployed commit)
+        id: base
+        uses: ./.github/actions/resolve-deploy-base
+        with:
+          environment: ${{ env.TARGET_ENV }}
+          use-manual-sha: ${{ vars.DELTA_USE_MANUAL_FROM_SHA }}
+          manual-sha: ${{ vars.DELTA_MANUAL_FROM_SHA }}
+
+      # =================================================================
+      # STEP 6 - CALCULATE THE DELTA  (base .. HEAD)
+      # =================================================================
+      - name: Calculate delta
+        uses: ./.github/actions/calculate-delta
+        with:
+          from-sha: ${{ steps.base.outputs.sha }}
+
+      # =================================================================
+      # STEP 7 - KEEP THE DELTA AS AN ARTIFACT
+      # =================================================================
+      # Uploaded BEFORE login/deploy and with always(), so even if the
+      # deployment fails you can still download exactly what was attempted.
+      - name: Upload delta artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-${{ env.TARGET_ENV }}-${{ github.sha }}-run${{ github.run_id }}-${{ github.run_attempt }}
+          path: delta/
+          retention-days: 90
+          if-no-files-found: warn
+
+      # =================================================================
+      # STEP 8 - LOGIN TO SALESFORCE (JWT)
+      # =================================================================
+      # Non-interactive login with Connected App + private key.
+      # See .github/actions/sf-login.
+      - name: Login to Salesforce
+        uses: ./.github/actions/sf-login
+        with:
+          client-id: ${{ secrets.CLIENT_ID }}
+          jwt-key: ${{ secrets.JWT_KEY_FILE_CONTENT }}
+          username: ${{ vars.USERNAME }}
+          instance-url: ${{ vars.INSTANCE_URL }}
+
+      # =================================================================
+      # STEP 9 - DEPLOY (or dry-run) THE DELTA
+      # =================================================================
+      # dry-run is 'true' when the user picked mode=dry-run, else 'false'.
+      # Real deploy -> changes saved to the org. Dry-run -> validate only.
+      # See .github/actions/sf-deploy.
+      - name: Deploy or dry-run the delta
+        uses: ./.github/actions/sf-deploy
+        with:
+          username: ${{ vars.USERNAME }}
+          dry-run: ${{ env.DRY_RUN_MODE }}
+          test-level: ${{ vars.TEST_LEVEL }}
+          test-classes: ${{ vars.TEST_CLASSES }}
+          allow-destructive: ${{ vars.ALLOW_DESTRUCTIVE_CHANGES || 'false' }}
+
+      # =================================================================
+      # STEP 10 - MOVE THE "deployed/<env>" TAG TO HEAD
+      # =================================================================
+      # Records "this commit is now live in this org". Runs ONLY IF
+      #   success()                 -> every previous step succeeded, AND
+      #   DRY_RUN_MODE == 'false'   -> it was a real deployment.
+      # A failed deploy or a dry-run therefore never moves the tag.
+      - name: Move deployed tag
+        if: success() && env.DRY_RUN_MODE == 'false'
+        run: |
+          # git needs an identity to create an ANNOTATED tag (a tag object
+          # with author, date and message). We use the standard bot identity.
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          TAG="deployed/${{ env.TARGET_ENV }}"
+          # HEAD = the commit that was just deployed.
+          COMMIT_SHA="$(git rev-parse HEAD)"
+          # ${VAR:0:7} = first 7 characters (short SHA) for a readable message.
+          SHORT_SHA="${COMMIT_SHA:0:7}"
+          TAG_MSG="Deployed to ${{ env.TARGET_ENV }} by ${{ github.actor }} (Run #${{ github.run_id }}, Commit ${SHORT_SHA})"
+
+          echo "Creating annotated tag: ${TAG}"
+          # -a = annotated tag, -f = overwrite the old tag if it exists
+          # (moving the tag forward is the whole point), -m = message.
+          git tag -a -f "$TAG" -m "$TAG_MSG" "$COMMIT_SHA"
+
+          # Pushing can fail for transient network reasons, so retry up to 3
+          # times with a short pause before giving up.
+          PUSH_SUCCESS=false
+          for i in 1 2 3; do
+            echo "Attempt $i: Pushing tag ${TAG} to origin..."
+            # refs/tags/<name> is the full ref name (unambiguous).
+            # --force is required because the tag already exists remotely
+            # and points to the OLD commit; we are intentionally moving it.
+            if git push origin "refs/tags/${TAG}" --force; then
+              PUSH_SUCCESS=true
+              echo "✅ Tag ${TAG} successfully pushed to origin."
+              break
+            fi
+            echo "::warning::Push attempt $i failed. Retrying in 3 seconds..."
+            sleep 3
+          done
+
+          # If all retries failed the ORG IS ALREADY UPDATED but the tag is
+          # stale. Fail loudly and print the exact commands a human must run
+          # to repair the tracking, otherwise the next delta would re-include
+          # already deployed changes.
+          if [ "$PUSH_SUCCESS" = "false" ]; then
+            echo "::error::Failed to push tag '${TAG}' after 3 attempts."
+            if [ -n "$GITHUB_STEP_SUMMARY" ]; then
+              {
+                echo "### ❌ Tag Update Failed (Action Required)"
+                echo "> **Warning:** Salesforce deployment **SUCCEEDED**, but GitHub failed to update the tracking tag \`${TAG}\`."
+                echo "> Please manually run the following commands on your local machine to keep the deployment tracking in sync:"
+                echo ""
+                echo "\`\`\`bash"
+                echo "git fetch origin"
+                echo "git tag -a -f ${TAG} -m \"${TAG_MSG}\" ${COMMIT_SHA}"
+                echo "git push origin refs/tags/${TAG} --force"
+                echo "\`\`\`"
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
+            exit 1
+          fi

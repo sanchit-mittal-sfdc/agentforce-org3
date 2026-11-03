@@ -1,0 +1,229 @@
+# =====================================================================
+# COMPOSITE ACTION : code-analysis
+# FILE             : .github/actions/code-analysis/action.yml
+# =====================================================================
+#
+# PURPOSE:
+#   Static code analysis of the files changed in a pull request, producing
+#   one interactive HTML report that the reviewer downloads and shares with
+#   the developer ("this is high severity, fix it"). It reduces manual
+#   review effort. It is INFORMATIONAL: it must never fail the pipeline.
+#
+# WHAT IS "STATIC" ANALYSIS?
+#   The code is read and checked against rules WITHOUT being executed or
+#   deployed (unlike the Apex tests, which run in the org).
+#
+# TOOL: Salesforce Code Analyzer v5  (free, official, open source)
+#   Installed as an SF CLI plugin:  sf plugins install code-analyzer
+#   Run with:                       sf code-analyzer run
+#   It is a wrapper that runs several "engines" and merges their findings:
+#     PMD          Apex classes/triggers: best practice, design, security,
+#                  performance, error-prone code, code style
+#     ESLint       JavaScript of LWC / Aura components
+#     RetireJS     known-vulnerable bundled JavaScript libraries
+#     Regex        custom text-pattern rules (disabled in this project)
+#     Flow         Salesforce Flow best practices
+#     CPD          copy/paste (duplicate code) detection
+#   Severity scale: 1 Critical, 2 High, 3 Moderate, 4 Low, 5 Info.
+#
+# WHY THE CLI AND NOT THE "forcedotcom/run-code-analyzer" GITHUB ACTION?
+#   The Nestle GitHub Enterprise only allows whitelisted actions, and that
+#   action is blocked ("is not allowed in nestle-it/..."). Plain shell steps
+#   need no approval. The only third-party step left is the first-party
+#   actions/upload-artifact, which is allowed.
+#
+# CONFIGURATION (read from the repository root automatically):
+#   code-analyzer.yml     which engines run and their settings
+#   .github/apex-ruleset.xml   the PMD rule categories for Apex
+#   eslint.config.js      the ESLint rules (needs node_modules, see step 4)
+#
+# SCOPE = DELTA ONLY:
+#   --workspace delta restricts the scan to the changed files, so the report
+#   stays small, fast and relevant to the PR (not the whole force-app).
+#
+# SWITCH:
+#   Environment variable IS_RUN_CODE_ANALYSIS. Only the exact string 'false'
+#   turns it off; unset means ON. The workflow converts it and passes the
+#   result into the input run-code-analysis below.
+#
+# OUTPUT:
+#   Artifact "code-analysis-report-<sha>-run<id>-<attempt>" containing
+#   sfca_results.html. Download the zip from the run page, unzip, open the
+#   HTML in a browser (filter by severity / engine / rule / file).
+#
+# NEVER FAILS THE PIPELINE - HOW:
+#   The analyzer command is wrapped in "set +e ... set -e" so a non-zero
+#   exit code is captured instead of aborting the step. The calling workflow
+#   also runs this action with if: always().
+# =====================================================================
+
+name: Code Analysis
+description: Runs Salesforce Code Analyzer v5 on delta files. Never fails the pipeline. Uploads interactive HTML report as artifact.
+
+inputs:
+  run-code-analysis:
+    # 'false' skips everything. Anything else (including empty) runs it.
+    description: Set to 'false' to skip code-analysis
+    required: false
+    default: "true"
+  delta-path:
+    description: Path to the delta directory
+    required: false
+    default: delta
+
+runs:
+  using: composite
+  steps:
+    # -----------------------------------------------------------------
+    # STEP 1 - Announce the skip (switch OFF)
+    # -----------------------------------------------------------------
+    # Runs only when the switch is exactly 'false'. Every later step has
+    # its own "!= 'false'" condition, so they are all skipped as well.
+    # A visible warning prevents "why is there no report?" confusion.
+    - name: Code analysis skipped
+      if: ${{ inputs.run-code-analysis == 'false' }}
+      shell: bash
+      run: |
+        echo "::warning::Code analysis skipped — IS_RUN_CODE_ANALYSIS is 'false' for this environment."
+
+    # -----------------------------------------------------------------
+    # STEP 2 - Is there anything worth analysing in the delta?
+    # -----------------------------------------------------------------
+    # A PR may change only objects/fields/permission sets (XML) - nothing the
+    # analyzer can check. Running it would be wasted time (the plugin install
+    # alone is ~20 s), so we look first.
+    # "id: delta-files" lets later steps read steps.delta-files.outputs.found.
+    - name: Find analysable files in delta
+      if: ${{ inputs.run-code-analysis != 'false' }}
+      id: delta-files
+      shell: bash
+      env:
+        DELTA_PATH: ${{ inputs.delta-path }}
+      run: |
+        # find <dir> -type f \( A -o B -o C \)
+        #   -type f   regular files only
+        #   -name     glob match on the file name
+        #   -o        logical OR
+        #   \( \)     grouping (parentheses escaped from the shell)
+        # Matched: Apex (.cls/.trigger), JS and HTML (LWC/Aura) and Flows.
+        # 2>/dev/null hides errors (e.g. folder missing).
+        # head -1 stops after the FIRST hit - we only need yes/no.
+        FILES=$(find "$DELTA_PATH" -type f \( \
+          -name "*.cls" -o -name "*.trigger" -o \
+          -name "*.js" -o -name "*.html" -o -name "*.flow-meta.xml" \
+        \) 2>/dev/null | head -1)
+        # -z = "string is empty" -> nothing found.
+        if [ -z "$FILES" ]; then
+          echo "found=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "found=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    # -----------------------------------------------------------------
+    # STEP 3 - Nothing to analyse: say so and stop
+    # -----------------------------------------------------------------
+    - name: Code analysis — No analysable files in delta
+      if: ${{ inputs.run-code-analysis != 'false' && steps.delta-files.outputs.found == 'false' }}
+      shell: bash
+      run: |
+        echo "No analysable files (Apex, LWC JS/HTML, Flow) changed in this PR — Code Analysis skipped."
+
+    # -----------------------------------------------------------------
+    # STEP 4 - Install the project's npm dependencies
+    # -----------------------------------------------------------------
+    # eslint.config.js imports packages such as @salesforce/eslint-config-lwc.
+    # Those live in package.json and must exist in node_modules, otherwise
+    # ESLint cannot load the project rules and fails.
+    # "npm ci" = clean, reproducible install exactly as pinned in
+    # package-lock.json (stricter and faster than "npm install"; it errors
+    # if package.json and the lock file disagree).
+    - name: Install project dependencies (for ESLint config)
+      if: ${{ inputs.run-code-analysis != 'false' && steps.delta-files.outputs.found == 'true' }}
+      shell: bash
+      run: npm ci
+
+    # -----------------------------------------------------------------
+    # STEP 5 - Install the Code Analyzer plugin
+    # -----------------------------------------------------------------
+    - name: Install Salesforce Code Analyzer plugin
+      if: ${{ inputs.run-code-analysis != 'false' && steps.delta-files.outputs.found == 'true' }}
+      shell: bash
+      run: |
+        # "echo y |" answers a possible "do you trust this plugin?" prompt
+        # (CI has no keyboard). This plugin is signed by Salesforce, so the
+        # prompt normally does not appear, but the answer is harmless.
+        echo y | sf plugins install code-analyzer
+        # Verify it is really installed (grep fails the step if absent).
+        sf plugins | grep "code-analyzer"
+
+    # -----------------------------------------------------------------
+    # STEP 6 - Run the analysis
+    # -----------------------------------------------------------------
+    - name: Run Salesforce Code Analyzer
+      if: ${{ inputs.run-code-analysis != 'false' && steps.delta-files.outputs.found == 'true' }}
+      id: run-code-analyzer
+      shell: bash
+      env:
+        DELTA_PATH: ${{ inputs.delta-path }}
+      run: |
+        # set +e : DO NOT abort on a non-zero exit code. Without this the
+        # analyzer finding problems (or crashing) would fail the step and the
+        # whole PR check. We want "report, never block".
+        set +e
+        # sf code-analyzer run
+        #   --workspace    the files to analyse (only the delta folder)
+        #   --view detail  print every violation in the log (not just a
+        #                  table summary)
+        #   --output-file  also write a report; the file EXTENSION selects the
+        #                  format (.html = interactive report). Other options:
+        #                  .json .csv .xml .sarif
+        # No --rule-selector is given, so the tool's default selection
+        # ("Recommended" rules) applies. To widen it, add e.g.
+        # --rule-selector all  (more findings, more noise).
+        # No --severity-threshold is given, so findings do not change the
+        # exit code (that flag would make the command fail on violations).
+        sf code-analyzer run \
+          --workspace "$DELTA_PATH" \
+          --view detail \
+          --output-file sfca_results.html
+        # $? = exit code of the command that just ran. Save it BEFORE
+        # running any other command, because every command overwrites $?.
+        EXIT_CODE=$?
+        # Restore strict mode for the lines below.
+        set -e
+        # -f = "file exists". If the analyzer crashed before writing the
+        # report, warn (yellow) instead of failing.
+        if [ -f sfca_results.html ]; then
+          echo "Code Analyzer report generated: sfca_results.html"
+        else
+          echo "::warning::sfca_results.html was not produced — no violations found or analysis failed."
+        fi
+        # Expose the exit code as a step output (currently informational;
+        # a future quality gate could read steps.run-code-analyzer.outputs.exit-code).
+        echo "exit-code=${EXIT_CODE}" >> "$GITHUB_OUTPUT"
+
+    # -----------------------------------------------------------------
+    # STEP 7 - Tell the reader where the report is
+    # -----------------------------------------------------------------
+    # Purely a log message; deliberately no pass/fail logic here.
+    - name: Log violation summary
+      if: ${{ inputs.run-code-analysis != 'false' && steps.delta-files.outputs.found == 'true' }}
+      shell: bash
+      run: |
+        echo "Code Analysis complete."
+        echo "Download the 'code-analysis-report' artifact for the full interactive HTML report."
+
+    # -----------------------------------------------------------------
+    # STEP 8 - Publish the HTML report as a downloadable artifact
+    # -----------------------------------------------------------------
+    - name: Upload code analysis report artifact
+      # always() : upload even if an earlier step in this action failed.
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        # Unique per run/attempt: commit + run id + attempt number.
+        name: code-analysis-report-${{ github.sha }}-run${{ github.run_id }}-${{ github.run_attempt }}
+        path: sfca_results.html
+        # ignore = stay silent when analysis was skipped and no file exists.
+        if-no-files-found: ignore
+        retention-days: 90
