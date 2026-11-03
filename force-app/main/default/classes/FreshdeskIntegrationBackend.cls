@@ -76,7 +76,7 @@ public with sharing class FreshdeskIntegrationBackend
             
             System.debug(res.getStatusCode());
             System.debug(res.getStatus());            
-            System.debug(mappedRes);
+            System.debug('mappedresponse is'+mappedRes);
         } 
         catch(AuraHandledException e)
         {
