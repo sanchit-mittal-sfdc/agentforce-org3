@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="UTF-8"?>
+<?xml version="1.0" encoding="UTF-8" ?>
 <PermissionSet xmlns="http://soap.sforce.com/2006/04/metadata">
     <applicationVisibilities>
         <application>Integration_Hub</application>
@@ -12,7 +12,13 @@
         <enabled>true</enabled>
         <name>API_KEY_Integrations__mdt</name>
     </customMetadataTypeAccesses>
-    <description>I am creating everything in dev and then deploying to prod via Ci CD...so making this PSET to assign all permissions.</description>
+    <description
+  >I am creating everything in dev and then deploying to prod via Ci CD...so making this PSET to assign all permissions.</description>
+    <fieldPermissions>
+        <editable>false</editable>
+        <field>Account.Number_Of_Child_Contacts__c</field>
+        <readable>true</readable>
+    </fieldPermissions>
     <hasActivationRequired>false</hasActivationRequired>
     <label>Consolidated Permission Set</label>
     <tabSettings>
