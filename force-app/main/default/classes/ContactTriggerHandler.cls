@@ -153,18 +153,23 @@ public with sharing class ContactTriggerHandler {
 
       // Step 2: count the Contacts currently in the DB for these Accounts
       // (one SOQL for all Accounts - bulk safe)
-      for (Contact c : [
-        SELECT Id, AccountId
+      for (AggregateResult ar : [
+        SELECT COUNT(Id) ContactsCount, AccountId
         FROM Contact
         WHERE AccountId IN :setOfAffectedAccountIds
+        GROUP BY AccountId
       ]) {
-        // containsKey is always true here (map was pre-filled), kept as a guard
-        if (mapAccIdToConCount.containsKey(c.AccountId)) {
-          mapAccIdToConCount.put(
-            c.AccountId,
-            mapAccIdToConCount.get(c.AccountId) + 1
-          );
-        }
+        //  containsKey is always true here (map was pre-filled), kept as a guard
+        // if (mapAccIdToConCount.containsKey(c.AccountId)) {
+        //   mapAccIdToConCount.put(
+        //     c.AccountId,
+        //     mapAccIdToConCount.get(c.AccountId) + 1
+        //   );
+        // }
+
+        String accId = (String) ar.get('AccountId');
+        Integer count = (Integer) ar.get('ContactsCount');
+        mapAccIdToConCount.put(accId, count);
       }
 
       // Step 3: build Account records with the new count and update them
