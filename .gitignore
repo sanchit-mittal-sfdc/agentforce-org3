@@ -79,3 +79,4 @@ build/
 server-keys/
 .env.prod
 .env.dev
+delta/
