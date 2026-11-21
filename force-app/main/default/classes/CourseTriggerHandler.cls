@@ -17,8 +17,9 @@ public with sharing class CourseTriggerHandler {
     Map<Id, Course__c> oldMap,
     Map<Id, Course__c> newMap
   ) {
-    for (Course a : newMap.values()) {
-      Set<Id> affectedCourseIds = new Set<Id>();
+    Set<Id> affectedCourseIds = new Set<Id>();
+
+    for (Course__c a : newMap.values()) {
       if (a.OwnerId != oldMap.get(a.Id).OwnerId) {
         affectedCourseIds.add(a.Id);
       }
@@ -29,7 +30,7 @@ public with sharing class CourseTriggerHandler {
     }
     System.debug('affectedCourseIds = ' + affectedCourseIds);
 
-    List<CourseShare> listOfManualShares = [
+    List<Course__Share> listOfManualShares = [
       SELECT Id, ParentId, RowCause, UserOrGroupId, AccessLevel
       FROM Course__Share
       WHERE ParentId IN :affectedCourseIds AND RowCause = 'Manual'
